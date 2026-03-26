@@ -42,6 +42,17 @@ Behavior:
 - if `LAB_BUILDER_LOCAL_MODE=true`, the job is stored as a local stub
 - otherwise, the service submits a real Cloud Build job
 
+### `POST /source-bundles`
+Accepts a `multipart/form-data` upload, writes the received files to a temporary
+workspace, and generates a local `source.tar.gz`.
+
+Returned data includes:
+
+- local workspace path
+- local archive path
+- suggested future GCS object path
+- uploaded files list
+
 Example payload:
 
 ```json
@@ -69,6 +80,7 @@ GCP_REGION=europe-west9
 ARTIFACT_REGISTRY_HOST=europe-west9-docker.pkg.dev
 ARTIFACT_REGISTRY_REPO=altair-repo
 LAB_BUILD_SOURCE_BUCKET=altair-lab-builds
+LAB_BUNDLE_ROOT_DIR=/tmp/altair-lab-builder
 CLOUD_BUILD_TIMEOUT_SECONDS=1200
 # Optional:
 # CLOUD_BUILD_SERVICE_ACCOUNT=projects/altair-isen/serviceAccounts/build-sa@altair-isen.iam.gserviceaccount.com

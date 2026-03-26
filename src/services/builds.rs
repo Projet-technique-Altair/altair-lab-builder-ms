@@ -342,6 +342,7 @@ mod tests {
             artifact_registry_host: "europe-west9-docker.pkg.dev".into(),
             artifact_registry_repo: "altair-repo".into(),
             build_source_bucket: "altair-lab-builds".into(),
+            bundle_root_dir: "/tmp/altair-lab-builder".into(),
             cloud_build_timeout_seconds: 1200,
             cloud_build_service_account: None,
             cloud_build_logs_bucket: None,

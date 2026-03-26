@@ -2,7 +2,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::RwLock;
 
-use crate::services::builds::BuildsService;
+use crate::services::{builds::BuildsService, source_bundles::SourceBundlesService};
 
 #[derive(Debug, Clone)]
 pub struct BuilderConfig {
@@ -11,6 +11,7 @@ pub struct BuilderConfig {
     pub artifact_registry_host: String,
     pub artifact_registry_repo: String,
     pub build_source_bucket: String,
+    pub bundle_root_dir: String,
     pub cloud_build_timeout_seconds: u64,
     pub cloud_build_service_account: Option<String>,
     pub cloud_build_logs_bucket: Option<String>,
@@ -20,6 +21,7 @@ pub struct BuilderConfig {
 #[derive(Clone)]
 pub struct State {
     pub builds_service: BuildsService,
+    pub source_bundles_service: SourceBundlesService,
 }
 
 impl State {
@@ -33,6 +35,7 @@ impl State {
             ),
             artifact_registry_repo: env_or_default("ARTIFACT_REGISTRY_REPO", "altair-repo"),
             build_source_bucket: env_or_default("LAB_BUILD_SOURCE_BUCKET", "altair-lab-builds"),
+            bundle_root_dir: env_or_default("LAB_BUNDLE_ROOT_DIR", "/tmp/altair-lab-builder"),
             cloud_build_timeout_seconds: env_u64_or_default("CLOUD_BUILD_TIMEOUT_SECONDS", 1200),
             cloud_build_service_account: optional_env("CLOUD_BUILD_SERVICE_ACCOUNT"),
             cloud_build_logs_bucket: optional_env("CLOUD_BUILD_LOGS_BUCKET"),
@@ -41,8 +44,12 @@ impl State {
 
         let jobs = Arc::new(RwLock::new(HashMap::new()));
         let builds_service = BuildsService::new(config.clone(), jobs.clone());
+        let source_bundles_service = SourceBundlesService::new(config);
 
-        Self { builds_service }
+        Self {
+            builds_service,
+            source_bundles_service,
+        }
     }
 }
 
