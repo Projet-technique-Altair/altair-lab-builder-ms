@@ -94,7 +94,7 @@ europe-west9-docker.pkg.dev/PROJECT/altair-labs/lab-poc-1:v1
 
 ## Recommended Entry Point
 
-For frontend integration, the main entry point is:
+For platform integration, the main entry point is:
 
 ```text
 POST /builds/from-upload
@@ -109,6 +109,17 @@ It lets the caller send the lab files once and receive:
 - the computed `template_path`
 
 That makes it the cleanest endpoint for a "Create lab" workflow.
+
+In the current platform architecture, the frontend is not expected to call the
+builder directly. The intended flow is:
+
+```text
+frontend -> gateway -> lab-builder
+```
+
+The creator flow can therefore trigger the build in the background while the
+user submits the lab creation form, without exposing low-level builder output
+in the UI.
 
 ## API
 
@@ -175,6 +186,16 @@ Example:
 
 - `Lab POC 1` becomes `lab-poc-1`
 
+## Current Local Defaults
+
+For local development, the service expects:
+
+- Docker available on the host
+- `kind` available on the host
+- a local Kind cluster named `altair`
+
+The local `.env` and `.env.example` are aligned with that default cluster name.
+
 ## Returned `template_path`
 
 This is the most important output of the service.
@@ -187,4 +208,3 @@ can store and reuse.
 ```text
 lab-poc-1:v1
 ```
-
