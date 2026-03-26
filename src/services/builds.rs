@@ -1,10 +1,16 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use chrono::Utc;
+use flate2::read::GzDecoder;
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use tokio::sync::RwLock;
+use tar::Archive;
+use tokio::{fs, process::Command, sync::RwLock};
 use uuid::Uuid;
 
 use crate::{
@@ -36,7 +42,8 @@ impl BuildsService {
     }
 
     pub async fn create_build(&self, payload: CreateBuildRequest) -> Result<BuildJob, AppError> {
-        validate_gcs_path(&payload.source_archive_gcs_path)?;
+        self.validate_source_archive_path(&payload.source_archive_path)
+            .await?;
         validate_image_name(&payload.image_name)?;
 
         let build_id = Uuid::new_v4();
@@ -62,6 +69,13 @@ impl BuildsService {
             self.config.artifact_registry_repo,
             payload.image_name
         );
+        let versioned_image_uri = format!("{image_base}:{image_tag}");
+        let latest_image_uri = format!("{image_base}:latest");
+        let template_path = if self.config.local_mode {
+            format!("{}:{}", payload.image_name, image_tag)
+        } else {
+            versioned_image_uri.clone()
+        };
 
         let job = BuildJob {
             build_id,
@@ -69,27 +83,36 @@ impl BuildsService {
             requested_by: payload.requested_by,
             status: BuildStatus::Queued,
             dispatch_mode: if self.config.local_mode {
-                BuildDispatchMode::Stub
+                BuildDispatchMode::LocalDockerKind
             } else {
                 BuildDispatchMode::CloudBuild
             },
             image_name: payload.image_name,
-            image_tag: image_tag.clone(),
-            source_archive_gcs_path: payload.source_archive_gcs_path,
+            image_tag,
+            template_path,
+            source_archive_path: payload.source_archive_path,
             dockerfile_path,
             gcp_region: self.config.gcp_region.clone(),
             build_source_bucket: self.config.build_source_bucket.clone(),
+            local_kind_cluster_name: if self.config.local_mode
+                && self.config.local_kind_load_enabled
+            {
+                Some(self.config.local_kind_cluster_name.clone())
+            } else {
+                None
+            },
+            loaded_to_kind: false,
             cloud_build_id: None,
             cloud_build_name: None,
             cloud_build_operation_name: None,
             cloud_build_log_url: None,
-            versioned_image_uri: format!("{image_base}:{image_tag}"),
-            latest_image_uri: format!("{image_base}:latest"),
+            versioned_image_uri,
+            latest_image_uri,
             created_at: Utc::now(),
         };
 
         let job = if self.config.local_mode {
-            job
+            self.build_and_load_locally(job).await?
         } else {
             self.submit_to_cloud_build(job).await?
         };
@@ -107,8 +130,133 @@ impl BuildsService {
             .ok_or_else(|| AppError::NotFound(format!("Build job {build_id} not found")))
     }
 
+    async fn build_and_load_locally(&self, mut job: BuildJob) -> Result<BuildJob, AppError> {
+        if !self.config.local_execution_enabled {
+            job.status = BuildStatus::Ready;
+            return Ok(job);
+        }
+
+        let build_context_dir = self
+            .extract_archive_for_local_build(&job.source_archive_path, job.build_id)
+            .await?;
+
+        self.run_command(
+            &self.config.local_docker_binary,
+            &[
+                "build",
+                "-f",
+                job.dockerfile_path.as_str(),
+                "-t",
+                job.template_path.as_str(),
+                ".",
+            ],
+            Some(&build_context_dir),
+        )
+        .await?;
+
+        if self.config.local_kind_load_enabled {
+            self.run_command(
+                &self.config.local_kind_binary,
+                &[
+                    "load",
+                    "docker-image",
+                    job.template_path.as_str(),
+                    "--name",
+                    self.config.local_kind_cluster_name.as_str(),
+                ],
+                None,
+            )
+            .await?;
+            job.loaded_to_kind = true;
+        }
+
+        job.status = BuildStatus::Ready;
+        Ok(job)
+    }
+
+    async fn extract_archive_for_local_build(
+        &self,
+        archive_path: &str,
+        build_id: Uuid,
+    ) -> Result<PathBuf, AppError> {
+        let destination = Path::new(&self.config.bundle_root_dir)
+            .join("local-build-contexts")
+            .join(build_id.to_string());
+
+        if fs::try_exists(&destination).await.map_err(|error| {
+            AppError::Internal(format!("Failed to check local build context dir: {error}"))
+        })? {
+            fs::remove_dir_all(&destination).await.map_err(|error| {
+                AppError::Internal(format!(
+                    "Failed to clean previous local build context: {error}"
+                ))
+            })?;
+        }
+
+        fs::create_dir_all(&destination).await.map_err(|error| {
+            AppError::Internal(format!("Failed to create local build context dir: {error}"))
+        })?;
+
+        let archive_path = archive_path.to_string();
+        let destination_clone = destination.clone();
+        tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+            let archive_file = std::fs::File::open(&archive_path).map_err(|error| {
+                AppError::Internal(format!("Failed to open local source archive: {error}"))
+            })?;
+            let decoder = GzDecoder::new(archive_file);
+            let mut archive = Archive::new(decoder);
+            archive.unpack(&destination_clone).map_err(|error| {
+                AppError::Internal(format!("Failed to extract local source archive: {error}"))
+            })?;
+            Ok(())
+        })
+        .await
+        .map_err(|error| {
+            AppError::Internal(format!("Local archive extraction task join error: {error}"))
+        })??;
+
+        Ok(destination)
+    }
+
+    async fn run_command(
+        &self,
+        program: &str,
+        args: &[&str],
+        current_dir: Option<&Path>,
+    ) -> Result<(), AppError> {
+        let mut command = Command::new(program);
+        command.args(args);
+
+        if let Some(current_dir) = current_dir {
+            command.current_dir(current_dir);
+        }
+
+        let output = command.output().await.map_err(|error| {
+            AppError::Internal(format!("Failed to start command `{program}`: {error}"))
+        })?;
+
+        if output.status.success() {
+            return Ok(());
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let details = if !stderr.is_empty() {
+            stderr
+        } else if !stdout.is_empty() {
+            stdout
+        } else {
+            format!("exit status {}", output.status)
+        };
+
+        Err(AppError::Internal(format!(
+            "Command `{program} {}` failed: {details}",
+            args.join(" ")
+        )))
+    }
+
     async fn submit_to_cloud_build(&self, mut job: BuildJob) -> Result<BuildJob, AppError> {
-        let source = parse_gcs_uri(&job.source_archive_gcs_path)?;
+        let source = parse_gcs_uri(&job.source_archive_path)?;
         let build_request = self.build_cloud_build_request(&job, &source);
         let access_token = gcp_auth::provider()
             .await
@@ -158,6 +306,51 @@ impl BuildsService {
         job.cloud_build_log_url = payload.build_log_url();
 
         Ok(job)
+    }
+
+    async fn validate_source_archive_path(&self, value: &str) -> Result<(), AppError> {
+        let trimmed = value.trim();
+
+        if trimmed.is_empty() {
+            return Err(AppError::BadRequest(
+                "source_archive_path must not be empty".into(),
+            ));
+        }
+
+        if self.config.local_mode {
+            if trimmed.starts_with("gs://") {
+                return Err(AppError::BadRequest(
+                    "source_archive_path must point to a local .tar.gz archive when LAB_BUILDER_LOCAL_MODE=true".into(),
+                ));
+            }
+
+            let metadata = fs::metadata(trimmed).await.map_err(|error| {
+                AppError::BadRequest(format!(
+                    "source_archive_path must point to an existing local archive: {error}"
+                ))
+            })?;
+
+            if !metadata.is_file() {
+                return Err(AppError::BadRequest(
+                    "source_archive_path must point to a file".into(),
+                ));
+            }
+
+            if Path::new(trimmed)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                != Some("gz")
+                || !trimmed.ends_with(".tar.gz")
+            {
+                return Err(AppError::BadRequest(
+                    "source_archive_path must point to a .tar.gz archive".into(),
+                ));
+            }
+
+            return Ok(());
+        }
+
+        validate_gcs_path(trimmed)
     }
 
     fn build_cloud_build_request(&self, job: &BuildJob, source: &StorageSource) -> Value {
@@ -252,7 +445,7 @@ fn validate_gcs_path(value: &str) -> Result<(), AppError> {
         Ok(())
     } else {
         Err(AppError::BadRequest(
-            "source_archive_gcs_path must start with gs://".into(),
+            "source_archive_path must start with gs://".into(),
         ))
     }
 }
@@ -278,18 +471,18 @@ fn validate_image_name(value: &str) -> Result<(), AppError> {
 
 fn parse_gcs_uri(value: &str) -> Result<StorageSource, AppError> {
     let trimmed = value.trim();
-    let without_prefix = trimmed.strip_prefix("gs://").ok_or_else(|| {
-        AppError::BadRequest("source_archive_gcs_path must start with gs://".into())
-    })?;
+    let without_prefix = trimmed
+        .strip_prefix("gs://")
+        .ok_or_else(|| AppError::BadRequest("source_archive_path must start with gs://".into()))?;
     let (bucket, object) = without_prefix.split_once('/').ok_or_else(|| {
         AppError::BadRequest(
-            "source_archive_gcs_path must include both a bucket and an object path".into(),
+            "source_archive_path must include both a bucket and an object path".into(),
         )
     })?;
 
     if bucket.is_empty() || object.is_empty() {
         return Err(AppError::BadRequest(
-            "source_archive_gcs_path must include both a bucket and an object path".into(),
+            "source_archive_path must include both a bucket and an object path".into(),
         ));
     }
 
@@ -324,12 +517,16 @@ fn metadata_string(metadata: Option<&Value>, path: &[&str]) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{
+        collections::HashMap,
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     use tokio::sync::RwLock;
 
     use crate::models::{
-        build::{BuildDispatchMode, CreateBuildRequest},
+        build::{BuildDispatchMode, BuildStatus, CreateBuildRequest},
         state::BuilderConfig,
     };
 
@@ -340,48 +537,59 @@ mod tests {
             gcp_project_id: "altair-isen".into(),
             gcp_region: "europe-west9".into(),
             artifact_registry_host: "europe-west9-docker.pkg.dev".into(),
-            artifact_registry_repo: "altair-repo".into(),
+            artifact_registry_repo: "altair-labs".into(),
             build_source_bucket: "altair-lab-builds".into(),
             bundle_root_dir: "/tmp/altair-lab-builder".into(),
             cloud_build_timeout_seconds: 1200,
             cloud_build_service_account: None,
             cloud_build_logs_bucket: None,
+            local_execution_enabled: false,
+            local_docker_binary: "docker".into(),
+            local_kind_binary: "kind".into(),
+            local_kind_cluster_name: "kind".into(),
+            local_kind_load_enabled: true,
             local_mode: true,
         }
     }
 
     #[tokio::test]
-    async fn create_build_computes_image_uris() {
+    async fn create_build_accepts_local_archive_in_local_mode() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be valid")
+            .as_nanos();
+        let archive_path = std::env::temp_dir().join(format!("lab-builder-build-{unique}.tar.gz"));
+        std::fs::write(&archive_path, b"fake tar gz payload").expect("archive should be written");
+
         let service = BuildsService::new(test_config(), Arc::new(RwLock::new(HashMap::new())));
 
         let job = service
             .create_build(CreateBuildRequest {
-                lab_id: Some("lab-1".into()),
-                requested_by: Some("creator-1".into()),
-                image_name: "lab-poc-1".into(),
-                image_tag: Some("v7".into()),
-                source_archive_gcs_path: "gs://bucket/lab/source.tar.gz".into(),
-                dockerfile_path: None,
+                lab_id: Some("lab-local".into()),
+                requested_by: Some("creator-local".into()),
+                image_name: "lab-local".into(),
+                image_tag: None,
+                source_archive_path: archive_path.display().to_string(),
+                dockerfile_path: Some("Dockerfile".into()),
             })
             .await
-            .expect("build creation should succeed");
+            .expect("local archive should be accepted");
 
+        assert_eq!(job.dispatch_mode, BuildDispatchMode::LocalDockerKind);
+        assert_eq!(job.status, BuildStatus::Ready);
+        assert_eq!(job.template_path, "lab-local:v1");
         assert_eq!(
             job.versioned_image_uri,
-            "europe-west9-docker.pkg.dev/altair-isen/altair-repo/lab-poc-1:v7"
+            "europe-west9-docker.pkg.dev/altair-isen/altair-labs/lab-local:v1"
         );
-        assert_eq!(
-            job.latest_image_uri,
-            "europe-west9-docker.pkg.dev/altair-isen/altair-repo/lab-poc-1:latest"
-        );
-        assert_eq!(job.dispatch_mode, BuildDispatchMode::Stub);
-        assert_eq!(job.gcp_region, "europe-west9");
-        assert_eq!(job.build_source_bucket, "altair-lab-builds");
-        assert_eq!(job.status, crate::models::build::BuildStatus::Queued);
+        assert_eq!(job.source_archive_path, archive_path.display().to_string());
+        assert!(!job.loaded_to_kind);
+
+        let _ = std::fs::remove_file(archive_path);
     }
 
     #[tokio::test]
-    async fn create_build_rejects_non_gcs_source() {
+    async fn create_build_rejects_gcs_source_in_local_mode() {
         let service = BuildsService::new(test_config(), Arc::new(RwLock::new(HashMap::new())));
 
         let result = service
@@ -390,12 +598,40 @@ mod tests {
                 requested_by: None,
                 image_name: "lab-poc-1".into(),
                 image_tag: None,
-                source_archive_gcs_path: "/tmp/source.tar.gz".into(),
+                source_archive_path: "gs://bucket/lab/source.tar.gz".into(),
                 dockerfile_path: None,
             })
             .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn create_build_uses_cloud_build_in_non_local_mode() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be valid")
+            .as_nanos();
+        let archive_path = std::env::temp_dir().join(format!("lab-builder-cloud-{unique}.tar.gz"));
+        std::fs::write(&archive_path, b"fake tar gz payload").expect("archive should be written");
+
+        let mut config = test_config();
+        config.local_mode = false;
+        let service = BuildsService::new(config, Arc::new(RwLock::new(HashMap::new())));
+
+        let result = service
+            .create_build(CreateBuildRequest {
+                lab_id: None,
+                requested_by: None,
+                image_name: "lab-poc-1".into(),
+                image_tag: None,
+                source_archive_path: archive_path.display().to_string(),
+                dockerfile_path: None,
+            })
+            .await;
+
+        assert!(result.is_err());
+        let _ = std::fs::remove_file(archive_path);
     }
 
     #[test]
