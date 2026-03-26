@@ -1,0 +1,16 @@
+name: Lab Builder MS CI
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+    branches: [develop, main]
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    uses: Projet-technique-Altair/altair-ci/.github/workflows/rust-ms.yml@main
+    with:
+      rust_toolchain: stable
