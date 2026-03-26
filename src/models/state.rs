@@ -47,7 +47,10 @@ impl State {
             local_execution_enabled: parse_bool_env("LAB_BUILDER_LOCAL_EXECUTION_ENABLED", true),
             local_docker_binary: env_or_default("LAB_BUILDER_LOCAL_DOCKER_BINARY", "docker"),
             local_kind_binary: env_or_default("LAB_BUILDER_LOCAL_KIND_BINARY", "kind"),
-            local_kind_cluster_name: env_or_default("LAB_BUILDER_LOCAL_KIND_CLUSTER_NAME", "kind"),
+            local_kind_cluster_name: env_or_default(
+                "LAB_BUILDER_LOCAL_KIND_CLUSTER_NAME",
+                "altair",
+            ),
             local_kind_load_enabled: parse_bool_env("LAB_BUILDER_LOCAL_KIND_LOAD_ENABLED", true),
             local_mode: parse_bool_env("LAB_BUILDER_LOCAL_MODE", true),
         };
