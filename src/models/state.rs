@@ -15,6 +15,11 @@ pub struct BuilderConfig {
     pub cloud_build_timeout_seconds: u64,
     pub cloud_build_service_account: Option<String>,
     pub cloud_build_logs_bucket: Option<String>,
+    pub local_execution_enabled: bool,
+    pub local_docker_binary: String,
+    pub local_kind_binary: String,
+    pub local_kind_cluster_name: String,
+    pub local_kind_load_enabled: bool,
     pub local_mode: bool,
 }
 
@@ -33,12 +38,17 @@ impl State {
                 "ARTIFACT_REGISTRY_HOST",
                 "europe-west9-docker.pkg.dev",
             ),
-            artifact_registry_repo: env_or_default("ARTIFACT_REGISTRY_REPO", "altair-repo"),
+            artifact_registry_repo: env_or_default("ARTIFACT_REGISTRY_REPO", "altair-labs"),
             build_source_bucket: env_or_default("LAB_BUILD_SOURCE_BUCKET", "altair-lab-builds"),
             bundle_root_dir: env_or_default("LAB_BUNDLE_ROOT_DIR", "/tmp/altair-lab-builder"),
             cloud_build_timeout_seconds: env_u64_or_default("CLOUD_BUILD_TIMEOUT_SECONDS", 1200),
             cloud_build_service_account: optional_env("CLOUD_BUILD_SERVICE_ACCOUNT"),
             cloud_build_logs_bucket: optional_env("CLOUD_BUILD_LOGS_BUCKET"),
+            local_execution_enabled: parse_bool_env("LAB_BUILDER_LOCAL_EXECUTION_ENABLED", true),
+            local_docker_binary: env_or_default("LAB_BUILDER_LOCAL_DOCKER_BINARY", "docker"),
+            local_kind_binary: env_or_default("LAB_BUILDER_LOCAL_KIND_BINARY", "kind"),
+            local_kind_cluster_name: env_or_default("LAB_BUILDER_LOCAL_KIND_CLUSTER_NAME", "kind"),
+            local_kind_load_enabled: parse_bool_env("LAB_BUILDER_LOCAL_KIND_LOAD_ENABLED", true),
             local_mode: parse_bool_env("LAB_BUILDER_LOCAL_MODE", true),
         };
 

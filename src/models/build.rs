@@ -7,12 +7,13 @@ use uuid::Uuid;
 pub enum BuildStatus {
     Queued,
     Submitted,
+    Ready,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum BuildDispatchMode {
-    Stub,
+    LocalDockerKind,
     CloudBuild,
 }
 
@@ -22,7 +23,8 @@ pub struct CreateBuildRequest {
     pub requested_by: Option<String>,
     pub image_name: String,
     pub image_tag: Option<String>,
-    pub source_archive_gcs_path: String,
+    #[serde(alias = "source_archive_gcs_path")]
+    pub source_archive_path: String,
     pub dockerfile_path: Option<String>,
 }
 
@@ -35,10 +37,13 @@ pub struct BuildJob {
     pub dispatch_mode: BuildDispatchMode,
     pub image_name: String,
     pub image_tag: String,
-    pub source_archive_gcs_path: String,
+    pub template_path: String,
+    pub source_archive_path: String,
     pub dockerfile_path: String,
     pub gcp_region: String,
     pub build_source_bucket: String,
+    pub local_kind_cluster_name: Option<String>,
+    pub loaded_to_kind: bool,
     pub cloud_build_id: Option<String>,
     pub cloud_build_name: Option<String>,
     pub cloud_build_operation_name: Option<String>,

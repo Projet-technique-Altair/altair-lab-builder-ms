@@ -5,6 +5,7 @@ use std::{
 
 use chrono::Utc;
 use flate2::{write::GzEncoder, Compression};
+use reqwest::Client;
 use tar::Builder;
 use tokio::fs;
 use uuid::Uuid;
@@ -26,12 +27,14 @@ pub struct UploadedFileInput {
 #[derive(Clone)]
 pub struct SourceBundlesService {
     config: Arc<BuilderConfig>,
+    http_client: Client,
 }
 
 impl SourceBundlesService {
     pub fn new(config: BuilderConfig) -> Self {
         Self {
             config: Arc::new(config),
+            http_client: Client::new(),
         }
     }
 
@@ -113,6 +116,58 @@ impl SourceBundlesService {
             created_at: Utc::now(),
         })
     }
+
+    pub async fn upload_source_bundle_to_gcs(
+        &self,
+        bundle: &SourceBundle,
+    ) -> Result<String, AppError> {
+        let (bucket, object) = parse_gcs_uri(&bundle.suggested_gcs_path)?;
+        let archive_bytes = fs::read(&bundle.archive_path).await.map_err(|error| {
+            AppError::Internal(format!(
+                "Failed to read local archive for GCS upload: {error}"
+            ))
+        })?;
+
+        let access_token = gcp_auth::provider()
+            .await
+            .map_err(|error| AppError::Internal(format!("Failed to initialize GCP auth: {error}")))?
+            .token(&["https://www.googleapis.com/auth/cloud-platform"])
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!("Failed to obtain GCS upload token: {error}"))
+            })?;
+
+        let endpoint = format!(
+            "https://storage.googleapis.com/upload/storage/v1/b/{bucket}/o?uploadType=media&name={}",
+            urlencoding::encode(&object)
+        );
+
+        let response = self
+            .http_client
+            .post(endpoint)
+            .bearer_auth(access_token.as_str())
+            .header("Content-Type", "application/gzip")
+            .body(archive_bytes)
+            .send()
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!("Failed to call GCS upload API: {error}"))
+            })?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response
+                .text()
+                .await
+                .unwrap_or_else(|_| "<unavailable body>".to_string());
+            return Err(AppError::Internal(format!(
+                "GCS upload failed for {}: HTTP {} - {}",
+                bundle.suggested_gcs_path, status, body
+            )));
+        }
+
+        Ok(bundle.suggested_gcs_path.clone())
+    }
 }
 
 async fn create_tar_gz_archive(
@@ -184,6 +239,24 @@ fn sanitize_relative_path(value: &str) -> Result<PathBuf, AppError> {
     Ok(sanitized)
 }
 
+fn parse_gcs_uri(value: &str) -> Result<(String, String), AppError> {
+    let trimmed = value.trim();
+    let without_prefix = trimmed
+        .strip_prefix("gs://")
+        .ok_or_else(|| AppError::Internal(format!("Invalid suggested GCS path: {trimmed}")))?;
+    let (bucket, object) = without_prefix
+        .split_once('/')
+        .ok_or_else(|| AppError::Internal(format!("Invalid suggested GCS path: {trimmed}")))?;
+
+    if bucket.is_empty() || object.is_empty() {
+        return Err(AppError::Internal(format!(
+            "Invalid suggested GCS path: {trimmed}"
+        )));
+    }
+
+    Ok((bucket.to_string(), object.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::Path;
@@ -198,12 +271,17 @@ mod tests {
             gcp_project_id: "altair-isen".into(),
             gcp_region: "europe-west9".into(),
             artifact_registry_host: "europe-west9-docker.pkg.dev".into(),
-            artifact_registry_repo: "altair-repo".into(),
+            artifact_registry_repo: "altair-labs".into(),
             build_source_bucket: "altair-lab-builds".into(),
             bundle_root_dir,
             cloud_build_timeout_seconds: 1200,
             cloud_build_service_account: None,
             cloud_build_logs_bucket: None,
+            local_execution_enabled: false,
+            local_docker_binary: "docker".into(),
+            local_kind_binary: "kind".into(),
+            local_kind_cluster_name: "kind".into(),
+            local_kind_load_enabled: true,
             local_mode: true,
         }
     }

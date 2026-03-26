@@ -1,98 +1,190 @@
 # Altair Lab Builder MS
 
-> Stateless microservice dedicated to the lab creation pipeline.
+Stateless microservice dedicated to the build side of lab creation.
 
-## Role
+## Purpose
 
-This service is responsible for the build side of lab creation:
+This service is responsible for turning user-provided lab files into a runnable
+container image.
 
-- validate a lab build request
-- compute the target Artifact Registry image URIs
-- track build jobs for the PoC
-- provide a clean boundary before integrating GCS upload and Cloud Build
+It exists to isolate build orchestration from the rest of the platform:
 
-For the first PoC, the service is intentionally small:
+- `altair-labs-ms` manages lab metadata and pedagogy
+- `altair-lab-api-service` manages lab runtime orchestration
+- `altair-lab-builder-ms` manages build preparation and image production
 
-- no database
-- in-memory job store only
-- no file upload endpoint yet
+## What The Service Does
 
-The idea is to stabilize the API contract first, then plug the real build chain behind it.
+The builder receives lab files, prepares a clean build context, and produces a
+`template_path` that can be stored by the platform and used later to run the lab.
 
-## Planned Responsibilities
+Core responsibilities:
 
-Target chain for the next iterations:
+- accept uploaded lab files
+- create a temporary workspace
+- generate a `source.tar.gz`
+- build an image locally for development and PoC flows
+- load the image into `kind` in local mode
+- submit a remote Cloud Build job in non-local mode
+- compute and return the final `template_path`
+- expose build job state
 
-1. receive a build request after file upload
-2. point to a prepared `source.tar.gz` in GCS
-3. call Cloud Build
-4. push the runtime image to Artifact Registry
-5. expose build status back to the platform
+## What The Service Does Not Do
 
-## Current API
+The builder is intentionally narrow in scope.
+
+It does not:
+
+- store labs in the main database
+- manage the lab catalog
+- decide business publication rules
+- launch labs on the runtime platform
+- manage long-term persistence of build jobs
+
+## High-Level Workflow
+
+### Local mode
+
+Local mode is meant for development and fast PoC validation.
+
+1. receive uploaded files
+2. write them into a temporary workspace
+3. generate `source.tar.gz`
+4. extract the archive into a local build context
+5. run `docker build`
+6. tag the image as `<image_name>:<image_tag>`
+7. optionally load the image into the configured `kind` cluster
+8. return a local `template_path`
+
+In local mode, the returned `template_path` is a simple local image reference:
+
+```text
+<image_name>:<image_tag>
+```
+
+Example:
+
+```text
+lab-poc-1:v1
+```
+
+### Non-local mode
+
+Non-local mode is meant for the real remote build flow.
+
+1. receive uploaded files
+2. write them into a temporary workspace
+3. generate `source.tar.gz`
+4. upload the archive to object storage
+5. submit a Cloud Build job using that archive as source
+6. build and push the image to the labs registry
+7. return the versioned image URI as `template_path`
+
+In non-local mode, the returned `template_path` must follow this format:
+
+```text
+REGION-docker.pkg.dev/PROJECT/LABS_REPO/LAB_NAME:TAG
+```
+
+Example:
+
+```text
+europe-west9-docker.pkg.dev/PROJECT/altair-labs/lab-poc-1:v1
+```
+
+## Recommended Entry Point
+
+For frontend integration, the main entry point is:
+
+```text
+POST /builds/from-upload
+```
+
+This endpoint works for both local and non-local execution.
+
+It lets the caller send the lab files once and receive:
+
+- source bundle metadata
+- build job metadata
+- the computed `template_path`
+
+That makes it the cleanest endpoint for a "Create lab" workflow.
+
+## API
 
 ### `GET /health`
-Returns a basic health payload.
 
-### `POST /builds`
-Creates a build job in memory and returns the computed image URIs.
-
-Behavior:
-
-- if `LAB_BUILDER_LOCAL_MODE=true`, the job is stored as a local stub
-- otherwise, the service submits a real Cloud Build job
+Returns a lightweight health payload and the current execution mode.
 
 ### `POST /source-bundles`
+
 Accepts a `multipart/form-data` upload, writes the received files to a temporary
-workspace, and generates a local `source.tar.gz`.
+workspace, and generates a `source.tar.gz`.
 
 Returned data includes:
 
-- local workspace path
-- local archive path
-- suggested future GCS object path
-- uploaded files list
+- workspace location
+- archive location
+- generated file list
+- suggested remote archive path
 
-Example payload:
+This endpoint is useful when the caller wants to separate:
 
-```json
-{
-  "lab_id": "lab-poc-1",
-  "requested_by": "creator-123",
-  "image_name": "lab-poc-1",
-  "image_tag": "v1",
-  "source_archive_gcs_path": "gs://altair-lab-builds/builds/lab-poc-1/v1/source.tar.gz",
-  "dockerfile_path": "Dockerfile"
-}
+- source preparation
+- build submission
+
+### `POST /builds`
+
+Creates a build job from an existing archive path.
+
+Behavior:
+
+- in local mode, the archive path must point to a local `.tar.gz`
+- in non-local mode, the archive path must point to a remote object path
+- the service computes the image URIs
+- the service returns a build job with the resolved `template_path`
+
+### `POST /builds/from-upload`
+
+One-step endpoint that combines:
+
+- file upload
+- source bundle generation
+- build execution
+
+This is the endpoint intended for end-to-end builder integration.
+
+### `GET /builds/{build_id}`
+
+Returns the current in-memory representation of a previously created build job.
+
+## Naming Rules
+
+The service can derive the image name automatically.
+
+Priority order:
+
+1. `image_name`
+2. `lab_name`
+3. `lab_id`
+
+The resolved image name is normalized so it can be used safely as a container
+image name.
+
+Example:
+
+- `Lab POC 1` becomes `lab-poc-1`
+
+## Returned `template_path`
+
+This is the most important output of the service.
+
+The builder exists to produce a `template_path` that the rest of the platform
+can store and reuse.
+
+### Local mode
+
+```text
+lab-poc-1:v1
 ```
 
-### `GET /builds/:build_id`
-Returns the in-memory representation of a previously created job.
-
-## Environment Variables
-
-```bash
-PORT=8086
-RUST_LOG=info
-LAB_BUILDER_LOCAL_MODE=true
-GCP_PROJECT_ID=altair-isen
-GCP_REGION=europe-west9
-ARTIFACT_REGISTRY_HOST=europe-west9-docker.pkg.dev
-ARTIFACT_REGISTRY_REPO=altair-repo
-LAB_BUILD_SOURCE_BUCKET=altair-lab-builds
-LAB_BUNDLE_ROOT_DIR=/tmp/altair-lab-builder
-CLOUD_BUILD_TIMEOUT_SECONDS=1200
-# Optional:
-# CLOUD_BUILD_SERVICE_ACCOUNT=projects/altair-isen/serviceAccounts/build-sa@altair-isen.iam.gserviceaccount.com
-# CLOUD_BUILD_LOGS_BUCKET=gs://altair-cloudbuild-logs
-```
-
-## Why a Separate Microservice
-
-Keeping this chain outside `altair-labs-ms` and `altair-lab-api-service` is cleaner:
-
-- `altair-labs-ms` stays focused on catalog and pedagogy
-- `altair-lab-api-service` stays focused on runtime orchestration
-- this service owns build orchestration only
-
-That separation matches the architecture discussed for the lab creation PoC.

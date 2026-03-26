@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;
 
+use crate::models::build::BuildJob;
+
 #[derive(Debug, Clone, Serialize)]
 pub struct UploadedFile {
     pub path: String,
@@ -20,4 +22,10 @@ pub struct SourceBundle {
     pub file_count: usize,
     pub files: Vec<UploadedFile>,
     pub created_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BuildFromUploadResponse {
+    pub source_bundle: SourceBundle,
+    pub build_job: BuildJob,
 }
