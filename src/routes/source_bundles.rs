@@ -2,6 +2,7 @@ use axum::{
     extract::{Multipart, State},
     Json,
 };
+use tracing::info;
 
 use crate::{
     error::AppError,
@@ -29,6 +30,12 @@ pub async fn create_source_bundle(
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<SourceBundle>>, AppError> {
     let payload = parse_source_bundle_payload(multipart).await?;
+    info!(
+        lab_id = ?payload.lab_id,
+        requested_by = ?payload.requested_by,
+        file_count = payload.files.len(),
+        "Creating source bundle from multipart upload"
+    );
 
     let bundle = state
         .source_bundles_service
@@ -43,6 +50,16 @@ pub async fn create_build_from_upload(
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<BuildFromUploadResponse>>, AppError> {
     let payload = parse_source_bundle_payload(multipart).await?;
+    info!(
+        lab_id = ?payload.lab_id,
+        lab_name = ?payload.lab_name,
+        requested_by = ?payload.requested_by,
+        image_name = ?payload.image_name,
+        image_tag = ?payload.image_tag,
+        dockerfile_path = ?payload.dockerfile_path,
+        file_count = payload.files.len(),
+        "Received build-from-upload request"
+    );
 
     let image_name = payload
         .image_name
@@ -65,6 +82,7 @@ pub async fn create_build_from_upload(
                     .into(),
             )
         })?;
+    info!(image_name = %image_name, "Derived image name for build-from-upload request");
 
     let bundle = state
         .source_bundles_service
@@ -74,6 +92,13 @@ pub async fn create_build_from_upload(
             payload.files,
         )
         .await?;
+    info!(
+        bundle_id = %bundle.bundle_id,
+        archive_path = %bundle.archive_path,
+        archive_size_bytes = bundle.archive_size_bytes,
+        workspace_dir = %bundle.workspace_dir,
+        "Source bundle created for build-from-upload request"
+    );
 
     let source_archive_path = if state.builds_service.is_local_mode() {
         bundle.archive_path.clone()
@@ -83,6 +108,11 @@ pub async fn create_build_from_upload(
             .upload_source_bundle_to_gcs(&bundle)
             .await?
     };
+    info!(
+        source_archive_path = %source_archive_path,
+        local_mode = state.builds_service.is_local_mode(),
+        "Resolved source archive path for build"
+    );
 
     let build_job = state
         .builds_service
@@ -95,6 +125,13 @@ pub async fn create_build_from_upload(
             dockerfile_path: payload.dockerfile_path,
         })
         .await?;
+    info!(
+        build_id = %build_job.build_id,
+        template_path = %build_job.template_path,
+        status = ?build_job.status,
+        dispatch_mode = ?build_job.dispatch_mode,
+        "Build-from-upload request accepted"
+    );
 
     Ok(Json(ApiResponse::success(BuildFromUploadResponse {
         source_bundle: bundle,

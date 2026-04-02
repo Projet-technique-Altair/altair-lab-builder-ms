@@ -8,6 +8,7 @@ use flate2::{write::GzEncoder, Compression};
 use reqwest::Client;
 use tar::Builder;
 use tokio::fs;
+use tracing::info;
 use uuid::Uuid;
 
 use crate::{
@@ -50,6 +51,12 @@ impl SourceBundlesService {
                 "At least one uploaded file is required".into(),
             ));
         }
+        info!(
+            lab_id = ?lab_id,
+            requested_by = ?requested_by,
+            file_count = files.len(),
+            "Persisting uploaded files into builder workspace"
+        );
 
         let bundle_id = Uuid::new_v4();
         let root_dir = ensure_builder_root_dir(&self.config.bundle_root_dir).await?;
@@ -89,6 +96,12 @@ impl SourceBundlesService {
                 size_bytes: file.bytes.len() as u64,
             });
         }
+        info!(
+            bundle_id = %bundle_id,
+            workspace_dir = %workspace_dir.display(),
+            stored_file_count = stored_files.len(),
+            "Uploaded files written to workspace"
+        );
 
         create_tar_gz_archive(workspace_dir.clone(), archive_path.clone()).await?;
 
@@ -104,6 +117,13 @@ impl SourceBundlesService {
         let suggested_gcs_path = format!(
             "gs://{}/builds/{}/{}/source.tar.gz",
             self.config.build_source_bucket, bundle_key, bundle_id
+        );
+        info!(
+            bundle_id = %bundle_id,
+            archive_path = %archive_path.display(),
+            archive_size_bytes = archive_metadata.len(),
+            suggested_gcs_path = %suggested_gcs_path,
+            "Source bundle archive created"
         );
 
         Ok(SourceBundle {
@@ -178,12 +198,19 @@ async fn create_tar_gz_archive(
     archive_path: PathBuf,
 ) -> Result<(), AppError> {
     tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+        info!(
+            workspace_dir = %workspace_dir.display(),
+            archive_path = %archive_path.display(),
+            "Creating tar.gz archive from workspace root"
+        );
         let archive_file = std::fs::File::create(&archive_path).map_err(|error| {
             AppError::Internal(format!("Failed to create archive file: {error}"))
         })?;
         let encoder = GzEncoder::new(archive_file, Compression::default());
         let mut builder = Builder::new(encoder);
 
+        // Appending "." means the archive root is the workspace root itself. Docker build will
+        // therefore see the uploaded files directly at the context root after extraction.
         builder
             .append_dir_all(".", &workspace_dir)
             .map_err(|error| {
@@ -197,6 +224,11 @@ async fn create_tar_gz_archive(
         encoder.finish().map_err(|error| {
             AppError::Internal(format!("Failed to finish gzip archive: {error}"))
         })?;
+        info!(
+            workspace_dir = %workspace_dir.display(),
+            archive_path = %archive_path.display(),
+            "Tar.gz archive finalized successfully"
+        );
 
         Ok(())
     })
@@ -278,6 +310,7 @@ mod tests {
             build_source_bucket: "altair-lab-builds".into(),
             bundle_root_dir,
             cloud_build_timeout_seconds: 1200,
+            cloud_build_poll_interval_seconds: 1,
             cloud_build_service_account: None,
             cloud_build_logs_bucket: None,
             local_execution_enabled: false,

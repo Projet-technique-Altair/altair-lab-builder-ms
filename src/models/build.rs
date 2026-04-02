@@ -8,6 +8,7 @@ pub enum BuildStatus {
     Queued,
     Submitted,
     Ready,
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -34,6 +35,7 @@ pub struct BuildJob {
     pub lab_id: Option<String>,
     pub requested_by: Option<String>,
     pub status: BuildStatus,
+    pub failure_message: Option<String>,
     pub dispatch_mode: BuildDispatchMode,
     pub image_name: String,
     pub image_tag: String,

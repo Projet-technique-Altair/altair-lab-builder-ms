@@ -13,6 +13,7 @@ pub struct BuilderConfig {
     pub build_source_bucket: String,
     pub bundle_root_dir: String,
     pub cloud_build_timeout_seconds: u64,
+    pub cloud_build_poll_interval_seconds: u64,
     pub cloud_build_service_account: Option<String>,
     pub cloud_build_logs_bucket: Option<String>,
     pub local_execution_enabled: bool,
@@ -42,6 +43,10 @@ impl State {
             build_source_bucket: env_or_default("LAB_BUILD_SOURCE_BUCKET", "altair-lab-builds"),
             bundle_root_dir: env_or_default("LAB_BUNDLE_ROOT_DIR", "/tmp/altair-lab-builder"),
             cloud_build_timeout_seconds: env_u64_or_default("CLOUD_BUILD_TIMEOUT_SECONDS", 1200),
+            cloud_build_poll_interval_seconds: env_u64_or_default(
+                "CLOUD_BUILD_POLL_INTERVAL_SECONDS",
+                5,
+            ),
             cloud_build_service_account: optional_env("CLOUD_BUILD_SERVICE_ACCOUNT"),
             cloud_build_logs_bucket: optional_env("CLOUD_BUILD_LOGS_BUCKET"),
             local_execution_enabled: parse_bool_env("LAB_BUILDER_LOCAL_EXECUTION_ENABLED", true),

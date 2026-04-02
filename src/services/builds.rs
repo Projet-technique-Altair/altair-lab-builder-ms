@@ -10,7 +10,8 @@ use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tar::Archive;
-use tokio::{fs, process::Command, sync::RwLock};
+use tokio::{fs, process::Command, sync::RwLock, time::{sleep, Duration}};
+use tracing::info;
 use uuid::Uuid;
 
 use crate::{
@@ -45,6 +46,16 @@ impl BuildsService {
     }
 
     pub async fn create_build(&self, payload: CreateBuildRequest) -> Result<BuildJob, AppError> {
+        info!(
+            lab_id = ?payload.lab_id,
+            requested_by = ?payload.requested_by,
+            image_name = %payload.image_name,
+            image_tag = ?payload.image_tag,
+            source_archive_path = %payload.source_archive_path,
+            dockerfile_path = ?payload.dockerfile_path,
+            local_mode = self.config.local_mode,
+            "Creating build job"
+        );
         self.validate_source_archive_path(&payload.source_archive_path)
             .await?;
         validate_image_name(&payload.image_name)?;
@@ -84,7 +95,12 @@ impl BuildsService {
             build_id,
             lab_id: payload.lab_id,
             requested_by: payload.requested_by,
-            status: BuildStatus::Queued,
+            status: if self.config.local_mode {
+                BuildStatus::Submitted
+            } else {
+                BuildStatus::Queued
+            },
+            failure_message: None,
             dispatch_mode: if self.config.local_mode {
                 BuildDispatchMode::LocalDockerKind
             } else {
@@ -114,13 +130,29 @@ impl BuildsService {
             created_at: Utc::now(),
         };
 
-        let job = if self.config.local_mode {
-            self.build_and_load_locally(job).await?
-        } else {
-            self.submit_to_cloud_build(job).await?
-        };
+        if self.config.local_mode {
+            self.store_job(job.clone()).await;
+            self.spawn_local_build(job.clone());
+            info!(
+                build_id = %job.build_id,
+                status = ?job.status,
+                template_path = %job.template_path,
+                "Build job accepted for asynchronous local execution"
+            );
+            return Ok(job);
+        }
 
-        self.jobs.write().await.insert(build_id, job.clone());
+        let job = self.submit_to_cloud_build(job).await?;
+        info!(
+            build_id = %job.build_id,
+            status = ?job.status,
+            template_path = %job.template_path,
+            loaded_to_kind = job.loaded_to_kind,
+            "Build job finished"
+        );
+
+        self.store_job(job.clone()).await;
+        self.spawn_cloud_build_tracking(job.clone());
         Ok(job)
     }
 
@@ -133,18 +165,102 @@ impl BuildsService {
             .ok_or_else(|| AppError::NotFound(format!("Build job {build_id} not found")))
     }
 
+    async fn store_job(&self, job: BuildJob) {
+        self.jobs.write().await.insert(job.build_id, job);
+    }
+
+    fn spawn_local_build(&self, job: BuildJob) {
+        let service = self.clone();
+
+        tokio::spawn(async move {
+            let result = service.build_and_load_locally(job.clone()).await;
+
+            match result {
+                Ok(completed_job) => {
+                    info!(
+                        build_id = %completed_job.build_id,
+                        status = ?completed_job.status,
+                        template_path = %completed_job.template_path,
+                        loaded_to_kind = completed_job.loaded_to_kind,
+                        "Background local build job completed"
+                    );
+                    service.store_job(completed_job).await;
+                }
+                Err(error) => {
+                    let mut failed_job = job;
+                    failed_job.status = BuildStatus::Failed;
+                    failed_job.failure_message = Some(app_error_message(&error));
+                    info!(
+                        build_id = %failed_job.build_id,
+                        error = %error,
+                        "Background local build job failed"
+                    );
+                    service.store_job(failed_job).await;
+                }
+            }
+        });
+    }
+
+    fn spawn_cloud_build_tracking(&self, job: BuildJob) {
+        let service = self.clone();
+
+        tokio::spawn(async move {
+            let result = service.track_cloud_build(job.clone()).await;
+
+            match result {
+                Ok(updated_job) => {
+                    info!(
+                        build_id = %updated_job.build_id,
+                        status = ?updated_job.status,
+                        cloud_build_id = ?updated_job.cloud_build_id,
+                        "Background cloud build tracking completed"
+                    );
+                    service.store_job(updated_job).await;
+                }
+                Err(error) => {
+                    let mut failed_job = job;
+                    failed_job.status = BuildStatus::Failed;
+                    failed_job.failure_message = Some(app_error_message(&error));
+                    info!(
+                        build_id = %failed_job.build_id,
+                        error = %error,
+                        "Background cloud build tracking failed"
+                    );
+                    service.store_job(failed_job).await;
+                }
+            }
+        });
+    }
+
     async fn build_and_load_locally(&self, mut job: BuildJob) -> Result<BuildJob, AppError> {
         if !self.config.local_execution_enabled {
+            info!(
+                build_id = %job.build_id,
+                "Local execution is disabled; marking build as ready without docker/kind commands"
+            );
             job.status = BuildStatus::Ready;
+            job.failure_message = None;
             return Ok(job);
         }
 
         let archive_path = self
             .resolve_local_archive_path(&job.source_archive_path)
             .await?;
+        info!(
+            build_id = %job.build_id,
+            archive_path = %archive_path.display(),
+            "Resolved local source archive path"
+        );
         let build_context_dir = self
             .extract_archive_for_local_build(&archive_path, job.build_id)
             .await?;
+        info!(
+            build_id = %job.build_id,
+            build_context_dir = %build_context_dir.display(),
+            dockerfile_path = %job.dockerfile_path,
+            template_path = %job.template_path,
+            "Starting local docker build"
+        );
 
         self.run_command(
             &self.config.local_docker_binary,
@@ -159,8 +275,19 @@ impl BuildsService {
             Some(&build_context_dir),
         )
         .await?;
+        info!(
+            build_id = %job.build_id,
+            template_path = %job.template_path,
+            "Local docker build completed successfully"
+        );
 
         if self.config.local_kind_load_enabled {
+            info!(
+                build_id = %job.build_id,
+                cluster_name = %self.config.local_kind_cluster_name,
+                template_path = %job.template_path,
+                "Starting kind image load"
+            );
             self.run_command(
                 &self.config.local_kind_binary,
                 &[
@@ -174,9 +301,16 @@ impl BuildsService {
             )
             .await?;
             job.loaded_to_kind = true;
+            info!(
+                build_id = %job.build_id,
+                cluster_name = %self.config.local_kind_cluster_name,
+                template_path = %job.template_path,
+                "Kind image load completed successfully"
+            );
         }
 
         job.status = BuildStatus::Ready;
+        job.failure_message = None;
         Ok(job)
     }
 
@@ -207,6 +341,11 @@ impl BuildsService {
         let archive_path = archive_path.to_path_buf();
         let destination_clone = destination.clone();
         tokio::task::spawn_blocking(move || -> Result<(), AppError> {
+            info!(
+                archive_path = %archive_path.display(),
+                destination = %destination_clone.display(),
+                "Extracting source archive for local build"
+            );
             let archive_file = std::fs::File::open(&archive_path).map_err(|error| {
                 AppError::Internal(format!("Failed to open local source archive: {error}"))
             })?;
@@ -215,6 +354,11 @@ impl BuildsService {
             archive.unpack(&destination_clone).map_err(|error| {
                 AppError::Internal(format!("Failed to extract local source archive: {error}"))
             })?;
+            info!(
+                archive_path = %archive_path.display(),
+                destination = %destination_clone.display(),
+                "Source archive extracted successfully"
+            );
             Ok(())
         })
         .await
@@ -231,6 +375,12 @@ impl BuildsService {
         args: &[&str],
         current_dir: Option<&Path>,
     ) -> Result<(), AppError> {
+        info!(
+            program = %program,
+            args = %args.join(" "),
+            current_dir = ?current_dir.map(|path| path.display().to_string()),
+            "Executing local command"
+        );
         let mut command = Command::new(program);
         command.args(args);
 
@@ -243,6 +393,12 @@ impl BuildsService {
         })?;
 
         if output.status.success() {
+            info!(
+                program = %program,
+                args = %args.join(" "),
+                status = %output.status,
+                "Local command completed successfully"
+            );
             return Ok(());
         }
 
@@ -307,12 +463,105 @@ impl BuildsService {
         }
 
         job.status = BuildStatus::Submitted;
+        job.failure_message = None;
         job.cloud_build_operation_name = payload.name.clone();
         job.cloud_build_id = payload.build_id();
         job.cloud_build_name = payload.build_name();
         job.cloud_build_log_url = payload.build_log_url();
 
         Ok(job)
+    }
+
+    async fn track_cloud_build(&self, mut job: BuildJob) -> Result<BuildJob, AppError> {
+        let poll_interval = Duration::from_secs(self.config.cloud_build_poll_interval_seconds.max(1));
+
+        loop {
+            let snapshot = self.fetch_cloud_build_snapshot(&job).await?;
+
+            job.cloud_build_id = snapshot.id.or(job.cloud_build_id.clone());
+            job.cloud_build_name = snapshot.name.or(job.cloud_build_name.clone());
+            job.cloud_build_log_url = snapshot.log_url.or(job.cloud_build_log_url.clone());
+
+            match snapshot.status.as_deref() {
+                Some("SUCCESS") => {
+                    job.status = BuildStatus::Ready;
+                    job.failure_message = None;
+                    return Ok(job);
+                }
+                Some("FAILURE" | "INTERNAL_ERROR" | "TIMEOUT" | "CANCELLED" | "EXPIRED") => {
+                    job.status = BuildStatus::Failed;
+                    job.failure_message = Some(
+                        snapshot
+                            .status_detail
+                            .unwrap_or_else(|| format!("Cloud Build reported status {}", snapshot.status.unwrap_or_else(|| "UNKNOWN".into()))),
+                    );
+                    return Ok(job);
+                }
+                Some(status) => {
+                    info!(
+                        build_id = %job.build_id,
+                        cloud_build_status = %status,
+                        cloud_build_id = ?job.cloud_build_id,
+                        "Cloud build still running"
+                    );
+                    self.store_job(job.clone()).await;
+                    sleep(poll_interval).await;
+                }
+                None => {
+                    info!(
+                        build_id = %job.build_id,
+                        cloud_build_id = ?job.cloud_build_id,
+                        "Cloud build snapshot missing status; retrying"
+                    );
+                    self.store_job(job.clone()).await;
+                    sleep(poll_interval).await;
+                }
+            }
+        }
+    }
+
+    async fn fetch_cloud_build_snapshot(&self, job: &BuildJob) -> Result<CloudBuildSnapshot, AppError> {
+        let endpoint = build_cloud_build_get_endpoint(
+            &self.config.gcp_project_id,
+            &self.config.gcp_region,
+            job.cloud_build_name.as_deref(),
+            job.cloud_build_id.as_deref(),
+        )?;
+
+        let access_token = gcp_auth::provider()
+            .await
+            .map_err(|error| AppError::Internal(format!("Failed to initialize GCP auth: {error}")))?
+            .token(&["https://www.googleapis.com/auth/cloud-platform"])
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!("Failed to obtain Cloud Build token: {error}"))
+            })?;
+
+        let response = self
+            .http_client
+            .get(endpoint)
+            .bearer_auth(access_token.as_str())
+            .send()
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!("Failed to query Cloud Build status: {error}"))
+            })?;
+
+        let status = response.status();
+        let payload = response
+            .json::<CloudBuildSnapshot>()
+            .await
+            .map_err(|error| {
+                AppError::Internal(format!("Failed to decode Cloud Build status response: {error}"))
+            })?;
+
+        if !status.is_success() {
+            return Err(AppError::Internal(format!(
+                "Cloud Build status query failed with HTTP {status}"
+            )));
+        }
+
+        Ok(payload)
     }
 
     async fn validate_source_archive_path(&self, value: &str) -> Result<(), AppError> {
@@ -431,6 +680,17 @@ struct CloudBuildOperation {
     name: Option<String>,
     metadata: Option<Value>,
     error: Option<CloudBuildApiError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CloudBuildSnapshot {
+    id: Option<String>,
+    name: Option<String>,
+    status: Option<String>,
+    #[serde(rename = "statusDetail")]
+    status_detail: Option<String>,
+    #[serde(rename = "logUrl")]
+    log_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -557,6 +817,68 @@ fn build_cloud_build_endpoint(project_id: &str, region: &str) -> Result<Url, App
     Ok(endpoint)
 }
 
+fn build_cloud_build_get_endpoint(
+    project_id: &str,
+    region: &str,
+    build_name: Option<&str>,
+    build_id: Option<&str>,
+) -> Result<Url, AppError> {
+    validate_gcp_project_id(project_id)?;
+    validate_gcp_region(region)?;
+
+    let mut endpoint = Url::parse(CLOUD_BUILD_API_BASE_URL)
+        .map_err(|error| AppError::Internal(format!("Invalid Cloud Build base URL: {error}")))?;
+
+    let path_segments: Vec<String> = if let Some(name) = build_name {
+        let trimmed = name.trim().trim_matches('/');
+        if trimmed.is_empty() {
+            return Err(AppError::Internal(
+                "Cloud Build name must not be empty when provided".into(),
+            ));
+        }
+
+        trimmed.split('/').map(str::to_string).collect()
+    } else if let Some(id) = build_id {
+        let trimmed = id.trim();
+        if trimmed.is_empty() {
+            return Err(AppError::Internal(
+                "Cloud Build id must not be empty when provided".into(),
+            ));
+        }
+
+        vec![
+            "v1".into(),
+            "projects".into(),
+            project_id.into(),
+            "locations".into(),
+            region.into(),
+            "builds".into(),
+            trimmed.into(),
+        ]
+    } else {
+        return Err(AppError::Internal(
+            "Cloud build tracking requires either a build name or a build id".into(),
+        ));
+    };
+
+    {
+        let mut segments = endpoint.path_segments_mut().map_err(|_| {
+            AppError::Internal("Cloud Build base URL cannot accept path segments".into())
+        })?;
+        segments.extend(path_segments);
+    }
+
+    Ok(endpoint)
+}
+
+fn app_error_message(error: &AppError) -> String {
+    match error {
+        AppError::BadRequest(message)
+        | AppError::NotFound(message)
+        | AppError::Internal(message) => message.clone(),
+    }
+}
+
 fn validate_image_name(value: &str) -> Result<(), AppError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -631,6 +953,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
+    use tokio::time::{sleep, Duration, Instant};
     use tokio::sync::RwLock;
 
     use crate::models::{
@@ -639,9 +962,37 @@ mod tests {
     };
 
     use super::{
-        build_cloud_build_endpoint, normalized_service_account, parse_gcs_uri,
+        build_cloud_build_endpoint, build_cloud_build_get_endpoint, normalized_service_account, parse_gcs_uri,
         validate_gcp_project_id, validate_gcp_region, BuildsService,
     };
+
+    async fn wait_for_build_status(
+        service: &BuildsService,
+        build_id: uuid::Uuid,
+        expected_status: BuildStatus,
+    ) -> crate::models::build::BuildJob {
+        let deadline = Instant::now() + Duration::from_secs(2);
+
+        loop {
+            let job = service
+                .get_build(build_id)
+                .await
+                .expect("build job should exist while polling");
+
+            if job.status == expected_status {
+                return job;
+            }
+
+            assert!(
+                Instant::now() < deadline,
+                "timed out while waiting for build status {:?}, last seen {:?}",
+                expected_status,
+                job.status
+            );
+
+            sleep(Duration::from_millis(10)).await;
+        }
+    }
 
     fn test_config() -> BuilderConfig {
         let unique = SystemTime::now()
@@ -661,6 +1012,7 @@ mod tests {
             build_source_bucket: "altair-lab-builds".into(),
             bundle_root_dir,
             cloud_build_timeout_seconds: 1200,
+            cloud_build_poll_interval_seconds: 1,
             cloud_build_service_account: None,
             cloud_build_logs_bucket: None,
             local_execution_enabled: false,
@@ -701,7 +1053,7 @@ mod tests {
             .expect("local archive should be accepted");
 
         assert_eq!(job.dispatch_mode, BuildDispatchMode::LocalDockerKind);
-        assert_eq!(job.status, BuildStatus::Ready);
+        assert_eq!(job.status, BuildStatus::Submitted);
         assert_eq!(job.template_path, "lab-local:v1");
         assert_eq!(
             job.versioned_image_uri,
@@ -709,6 +1061,10 @@ mod tests {
         );
         assert_eq!(job.source_archive_path, archive_path.display().to_string());
         assert!(!job.loaded_to_kind);
+
+        let completed_job = wait_for_build_status(&service, job.build_id, BuildStatus::Ready).await;
+        assert_eq!(completed_job.status, BuildStatus::Ready);
+        assert_eq!(completed_job.failure_message, None);
 
         let _ = std::fs::remove_dir_all(Path::new(&config.bundle_root_dir));
     }
@@ -846,6 +1202,38 @@ mod tests {
         assert_eq!(
             endpoint.as_str(),
             "https://cloudbuild.googleapis.com/v1/projects/altair-isen/locations/europe-west9/builds?projectId=altair-isen"
+        );
+    }
+
+    #[test]
+    fn build_cloud_build_get_endpoint_accepts_build_name() {
+        let endpoint = build_cloud_build_get_endpoint(
+            "altair-isen",
+            "europe-west9",
+            Some("v1/projects/altair-isen/locations/europe-west9/builds/123"),
+            None,
+        )
+        .expect("endpoint should be valid");
+
+        assert_eq!(
+            endpoint.as_str(),
+            "https://cloudbuild.googleapis.com/v1/projects/altair-isen/locations/europe-west9/builds/123"
+        );
+    }
+
+    #[test]
+    fn build_cloud_build_get_endpoint_falls_back_to_build_id() {
+        let endpoint = build_cloud_build_get_endpoint(
+            "altair-isen",
+            "europe-west9",
+            None,
+            Some("123"),
+        )
+        .expect("endpoint should be valid");
+
+        assert_eq!(
+            endpoint.as_str(),
+            "https://cloudbuild.googleapis.com/v1/projects/altair-isen/locations/europe-west9/builds/123"
         );
     }
 }
