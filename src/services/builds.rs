@@ -6,7 +6,7 @@ use std::{
 
 use chrono::Utc;
 use flate2::read::GzDecoder;
-use reqwest::Client;
+use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tar::Archive;
@@ -20,6 +20,8 @@ use crate::{
         state::BuilderConfig,
     },
 };
+
+const CLOUD_BUILD_API_BASE_URL: &str = "https://cloudbuild.googleapis.com/";
 
 #[derive(Clone)]
 pub struct BuildsService {
@@ -267,10 +269,10 @@ impl BuildsService {
                 AppError::Internal(format!("Failed to obtain Cloud Build token: {error}"))
             })?;
 
-        let endpoint = format!(
-            "https://cloudbuild.googleapis.com/v1/projects/{}/locations/{}/builds?projectId={}",
-            self.config.gcp_project_id, self.config.gcp_region, self.config.gcp_project_id
-        );
+        let endpoint = build_cloud_build_endpoint(
+            &self.config.gcp_project_id,
+            &self.config.gcp_region,
+        )?;
 
         let response = self
             .http_client
@@ -450,6 +452,97 @@ fn validate_gcs_path(value: &str) -> Result<(), AppError> {
     }
 }
 
+fn validate_gcp_project_id(value: &str) -> Result<(), AppError> {
+    let trimmed = value.trim();
+
+    if trimmed.is_empty() {
+        return Err(AppError::Internal("GCP project id must not be empty".into()));
+    }
+
+    if !(6..=30).contains(&trimmed.len()) {
+        return Err(AppError::Internal(
+            "GCP project id must be between 6 and 30 characters".into(),
+        ));
+    }
+
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    {
+        return Err(AppError::Internal(
+            "GCP project id contains forbidden characters".into(),
+        ));
+    }
+
+    if !trimmed
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_lowercase())
+    {
+        return Err(AppError::Internal(
+            "GCP project id must start with a lowercase letter".into(),
+        ));
+    }
+
+    if !trimmed
+        .chars()
+        .last()
+        .is_some_and(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit())
+    {
+        return Err(AppError::Internal(
+            "GCP project id must end with a lowercase letter or digit".into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn validate_gcp_region(value: &str) -> Result<(), AppError> {
+    let trimmed = value.trim();
+
+    if trimmed.is_empty() {
+        return Err(AppError::Internal("GCP region must not be empty".into()));
+    }
+
+    if trimmed.len() > 32 {
+        return Err(AppError::Internal("GCP region is too long".into()));
+    }
+
+    if !trimmed
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
+    {
+        return Err(AppError::Internal("GCP region contains forbidden characters".into()));
+    }
+
+    if trimmed.starts_with('-') || trimmed.ends_with('-') || !trimmed.contains('-') {
+        return Err(AppError::Internal("GCP region has an invalid format".into()));
+    }
+
+    Ok(())
+}
+
+fn build_cloud_build_endpoint(project_id: &str, region: &str) -> Result<Url, AppError> {
+    validate_gcp_project_id(project_id)?;
+    validate_gcp_region(region)?;
+
+    let mut endpoint = Url::parse(CLOUD_BUILD_API_BASE_URL)
+        .map_err(|error| AppError::Internal(format!("Invalid Cloud Build base URL: {error}")))?;
+
+    {
+        let mut segments = endpoint.path_segments_mut().map_err(|_| {
+            AppError::Internal("Cloud Build base URL cannot accept path segments".into())
+        })?;
+        segments.extend(["v1", "projects", project_id, "locations", region, "builds"]);
+    }
+
+    endpoint
+        .query_pairs_mut()
+        .append_pair("projectId", project_id);
+
+    Ok(endpoint)
+}
+
 fn validate_image_name(value: &str) -> Result<(), AppError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -530,7 +623,10 @@ mod tests {
         state::BuilderConfig,
     };
 
-    use super::{normalized_service_account, parse_gcs_uri, BuildsService};
+    use super::{
+        build_cloud_build_endpoint, normalized_service_account, parse_gcs_uri,
+        validate_gcp_project_id, validate_gcp_region, BuildsService,
+    };
 
     fn test_config() -> BuilderConfig {
         BuilderConfig {
@@ -654,6 +750,39 @@ mod tests {
         assert_eq!(
             value,
             "projects/altair-isen/serviceAccounts/build-sa@altair-isen.iam.gserviceaccount.com"
+        );
+    }
+
+    #[test]
+    fn validate_gcp_project_id_accepts_standard_project_id() {
+        assert!(validate_gcp_project_id("altair-isen").is_ok());
+    }
+
+    #[test]
+    fn validate_gcp_project_id_rejects_forbidden_characters() {
+        assert!(validate_gcp_project_id("altair-isen/evil").is_err());
+    }
+
+    #[test]
+    fn validate_gcp_region_accepts_standard_region() {
+        assert!(validate_gcp_region("europe-west9").is_ok());
+    }
+
+    #[test]
+    fn validate_gcp_region_rejects_invalid_format() {
+        assert!(validate_gcp_region("https://evil.example").is_err());
+    }
+
+    #[test]
+    fn build_cloud_build_endpoint_uses_fixed_google_host() {
+        let endpoint = build_cloud_build_endpoint("altair-isen", "europe-west9")
+            .expect("endpoint should be valid");
+
+        assert_eq!(endpoint.scheme(), "https");
+        assert_eq!(endpoint.host_str(), Some("cloudbuild.googleapis.com"));
+        assert_eq!(
+            endpoint.as_str(),
+            "https://cloudbuild.googleapis.com/v1/projects/altair-isen/locations/europe-west9/builds?projectId=altair-isen"
         );
     }
 }
