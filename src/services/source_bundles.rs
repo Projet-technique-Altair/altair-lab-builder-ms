@@ -16,6 +16,7 @@ use crate::{
         source_bundle::{SourceBundle, UploadedFile},
         state::BuilderConfig,
     },
+    services::path_safety::{ensure_builder_root_dir, join_relative_to_root},
 };
 
 #[derive(Debug, Clone)]
@@ -51,10 +52,12 @@ impl SourceBundlesService {
         }
 
         let bundle_id = Uuid::new_v4();
-        let bundle_root = Path::new(&self.config.bundle_root_dir).join(bundle_id.to_string());
-        let workspace_dir = bundle_root.join("workspace");
-        let artifacts_dir = bundle_root.join("artifacts");
-        let archive_path = artifacts_dir.join("source.tar.gz");
+        let root_dir = ensure_builder_root_dir(&self.config.bundle_root_dir).await?;
+        let bundle_id_string = bundle_id.to_string();
+        let bundle_root = join_relative_to_root(&root_dir, Path::new(&bundle_id_string))?;
+        let workspace_dir = join_relative_to_root(&bundle_root, Path::new("workspace"))?;
+        let artifacts_dir = join_relative_to_root(&bundle_root, Path::new("artifacts"))?;
+        let archive_path = join_relative_to_root(&artifacts_dir, Path::new("source.tar.gz"))?;
 
         fs::create_dir_all(&workspace_dir).await.map_err(|error| {
             AppError::Internal(format!("Failed to create workspace dir: {error}"))
@@ -67,7 +70,7 @@ impl SourceBundlesService {
 
         for file in files {
             let sanitized_path = sanitize_relative_path(&file.relative_path)?;
-            let destination = workspace_dir.join(&sanitized_path);
+            let destination = join_relative_to_root(&workspace_dir, &sanitized_path)?;
 
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent).await.map_err(|error| {
@@ -289,6 +292,12 @@ mod tests {
     #[test]
     fn sanitize_relative_path_rejects_parent_traversal() {
         let result = sanitize_relative_path("../etc/passwd");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn sanitize_relative_path_rejects_absolute_path() {
+        let result = sanitize_relative_path("/etc/passwd");
         assert!(result.is_err());
     }
 

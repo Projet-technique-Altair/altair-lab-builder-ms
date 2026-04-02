@@ -19,6 +19,7 @@ use crate::{
         build::{BuildDispatchMode, BuildJob, BuildStatus, CreateBuildRequest},
         state::BuilderConfig,
     },
+    services::path_safety::{ensure_builder_root_dir, join_relative_to_root, resolve_existing_path_within_root},
 };
 
 const CLOUD_BUILD_API_BASE_URL: &str = "https://cloudbuild.googleapis.com/";
@@ -138,8 +139,11 @@ impl BuildsService {
             return Ok(job);
         }
 
+        let archive_path = self
+            .resolve_local_archive_path(&job.source_archive_path)
+            .await?;
         let build_context_dir = self
-            .extract_archive_for_local_build(&job.source_archive_path, job.build_id)
+            .extract_archive_for_local_build(&archive_path, job.build_id)
             .await?;
 
         self.run_command(
@@ -178,12 +182,13 @@ impl BuildsService {
 
     async fn extract_archive_for_local_build(
         &self,
-        archive_path: &str,
+        archive_path: &Path,
         build_id: Uuid,
     ) -> Result<PathBuf, AppError> {
-        let destination = Path::new(&self.config.bundle_root_dir)
-            .join("local-build-contexts")
-            .join(build_id.to_string());
+        let root_dir = ensure_builder_root_dir(&self.config.bundle_root_dir).await?;
+        let local_contexts_dir = join_relative_to_root(&root_dir, Path::new("local-build-contexts"))?;
+        let build_id_string = build_id.to_string();
+        let destination = join_relative_to_root(&local_contexts_dir, Path::new(&build_id_string))?;
 
         if fs::try_exists(&destination).await.map_err(|error| {
             AppError::Internal(format!("Failed to check local build context dir: {error}"))
@@ -199,7 +204,7 @@ impl BuildsService {
             AppError::Internal(format!("Failed to create local build context dir: {error}"))
         })?;
 
-        let archive_path = archive_path.to_string();
+        let archive_path = archive_path.to_path_buf();
         let destination_clone = destination.clone();
         tokio::task::spawn_blocking(move || -> Result<(), AppError> {
             let archive_file = std::fs::File::open(&archive_path).map_err(|error| {
@@ -326,7 +331,8 @@ impl BuildsService {
                 ));
             }
 
-            let metadata = fs::metadata(trimmed).await.map_err(|error| {
+            let resolved_path = self.resolve_local_archive_path(trimmed).await?;
+            let metadata = fs::metadata(&resolved_path).await.map_err(|error| {
                 AppError::BadRequest(format!(
                     "source_archive_path must point to an existing local archive: {error}"
                 ))
@@ -338,11 +344,14 @@ impl BuildsService {
                 ));
             }
 
-            if Path::new(trimmed)
+            if resolved_path
                 .extension()
                 .and_then(|extension| extension.to_str())
                 != Some("gz")
-                || !trimmed.ends_with(".tar.gz")
+                || !resolved_path
+                    .to_string_lossy()
+                    .to_ascii_lowercase()
+                    .ends_with(".tar.gz")
             {
                 return Err(AppError::BadRequest(
                     "source_archive_path must point to a .tar.gz archive".into(),
@@ -353,6 +362,11 @@ impl BuildsService {
         }
 
         validate_gcs_path(trimmed)
+    }
+
+    async fn resolve_local_archive_path(&self, value: &str) -> Result<PathBuf, AppError> {
+        let root_dir = ensure_builder_root_dir(&self.config.bundle_root_dir).await?;
+        resolve_existing_path_within_root(&root_dir, value).await
     }
 
     fn build_cloud_build_request(&self, job: &BuildJob, source: &StorageSource) -> Value {
@@ -612,6 +626,7 @@ fn metadata_string(metadata: Option<&Value>, path: &[&str]) -> Option<String> {
 mod tests {
     use std::{
         collections::HashMap,
+        path::Path,
         sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
     };
@@ -629,13 +644,22 @@ mod tests {
     };
 
     fn test_config() -> BuilderConfig {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be valid")
+            .as_nanos();
+        let bundle_root_dir = std::env::temp_dir()
+            .join(format!("altair-lab-builder-tests-{unique}"))
+            .display()
+            .to_string();
+
         BuilderConfig {
             gcp_project_id: "altair-isen".into(),
             gcp_region: "europe-west9".into(),
             artifact_registry_host: "europe-west9-docker.pkg.dev".into(),
             artifact_registry_repo: "altair-labs".into(),
             build_source_bucket: "altair-lab-builds".into(),
-            bundle_root_dir: "/tmp/altair-lab-builder".into(),
+            bundle_root_dir,
             cloud_build_timeout_seconds: 1200,
             cloud_build_service_account: None,
             cloud_build_logs_bucket: None,
@@ -654,10 +678,15 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time should be valid")
             .as_nanos();
-        let archive_path = std::env::temp_dir().join(format!("lab-builder-build-{unique}.tar.gz"));
+        let config = test_config();
+        let archive_root = Path::new(&config.bundle_root_dir)
+            .join("artifacts")
+            .join(unique.to_string());
+        std::fs::create_dir_all(&archive_root).expect("archive root should be created");
+        let archive_path = archive_root.join("lab-builder-build.tar.gz");
         std::fs::write(&archive_path, b"fake tar gz payload").expect("archive should be written");
 
-        let service = BuildsService::new(test_config(), Arc::new(RwLock::new(HashMap::new())));
+        let service = BuildsService::new(config.clone(), Arc::new(RwLock::new(HashMap::new())));
 
         let job = service
             .create_build(CreateBuildRequest {
@@ -681,7 +710,7 @@ mod tests {
         assert_eq!(job.source_archive_path, archive_path.display().to_string());
         assert!(!job.loaded_to_kind);
 
-        let _ = std::fs::remove_file(archive_path);
+        let _ = std::fs::remove_dir_all(Path::new(&config.bundle_root_dir));
     }
 
     #[tokio::test]
@@ -708,10 +737,16 @@ mod tests {
             .duration_since(UNIX_EPOCH)
             .expect("time should be valid")
             .as_nanos();
-        let archive_path = std::env::temp_dir().join(format!("lab-builder-cloud-{unique}.tar.gz"));
+        let config = test_config();
+        let bundle_root_dir = config.bundle_root_dir.clone();
+        let archive_root = Path::new(&config.bundle_root_dir)
+            .join("artifacts")
+            .join(unique.to_string());
+        std::fs::create_dir_all(&archive_root).expect("archive root should be created");
+        let archive_path = archive_root.join("lab-builder-cloud.tar.gz");
         std::fs::write(&archive_path, b"fake tar gz payload").expect("archive should be written");
 
-        let mut config = test_config();
+        let mut config = config;
         config.local_mode = false;
         let service = BuildsService::new(config, Arc::new(RwLock::new(HashMap::new())));
 
@@ -727,7 +762,35 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        let _ = std::fs::remove_file(archive_path);
+        let _ = std::fs::remove_dir_all(bundle_root_dir);
+    }
+
+    #[tokio::test]
+    async fn create_build_rejects_local_archive_outside_bundle_root() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be valid")
+            .as_nanos();
+        let config = test_config();
+        let outside_archive = std::env::temp_dir().join(format!("outside-builder-{unique}.tar.gz"));
+        std::fs::write(&outside_archive, b"fake tar gz payload").expect("archive should be written");
+
+        let service = BuildsService::new(config, Arc::new(RwLock::new(HashMap::new())));
+
+        let result = service
+            .create_build(CreateBuildRequest {
+                lab_id: Some("lab-local".into()),
+                requested_by: Some("creator-local".into()),
+                image_name: "lab-local".into(),
+                image_tag: None,
+                source_archive_path: outside_archive.display().to_string(),
+                dockerfile_path: Some("Dockerfile".into()),
+            })
+            .await;
+
+        assert!(result.is_err());
+
+        let _ = std::fs::remove_file(outside_archive);
     }
 
     #[test]
