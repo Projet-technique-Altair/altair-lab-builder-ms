@@ -147,6 +147,9 @@ impl BuildsService {
             build_id = %job.build_id,
             status = ?job.status,
             template_path = %job.template_path,
+            cloud_build_id = ?job.cloud_build_id,
+            cloud_build_name = ?job.cloud_build_name,
+            cloud_build_operation_name = ?job.cloud_build_operation_name,
             loaded_to_kind = job.loaded_to_kind,
             "Build job finished"
         );
@@ -421,14 +424,7 @@ impl BuildsService {
     async fn submit_to_cloud_build(&self, mut job: BuildJob) -> Result<BuildJob, AppError> {
         let source = parse_gcs_uri(&job.source_archive_path)?;
         let build_request = self.build_cloud_build_request(&job, &source);
-        let access_token = gcp_auth::provider()
-            .await
-            .map_err(|error| AppError::Internal(format!("Failed to initialize GCP auth: {error}")))?
-            .token(&["https://www.googleapis.com/auth/cloud-platform"])
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!("Failed to obtain Cloud Build token: {error}"))
-            })?;
+        let access_token = self.cloud_build_access_token().await?;
 
         let endpoint = build_cloud_build_endpoint(
             &self.config.gcp_project_id,
@@ -474,50 +470,164 @@ impl BuildsService {
 
     async fn track_cloud_build(&self, mut job: BuildJob) -> Result<BuildJob, AppError> {
         let poll_interval = Duration::from_secs(self.config.cloud_build_poll_interval_seconds.max(1));
+        let mut consecutive_poll_errors = 0u8;
 
         loop {
-            let snapshot = self.fetch_cloud_build_snapshot(&job).await?;
-
-            job.cloud_build_id = snapshot.id.or(job.cloud_build_id.clone());
-            job.cloud_build_name = snapshot.name.or(job.cloud_build_name.clone());
-            job.cloud_build_log_url = snapshot.log_url.or(job.cloud_build_log_url.clone());
-
-            match snapshot.status.as_deref() {
-                Some("SUCCESS") => {
-                    job.status = BuildStatus::Ready;
-                    job.failure_message = None;
-                    return Ok(job);
+            let poll_state = match self.fetch_cloud_build_state(&job).await {
+                Ok(state) => {
+                    consecutive_poll_errors = 0;
+                    state
                 }
-                Some("FAILURE" | "INTERNAL_ERROR" | "TIMEOUT" | "CANCELLED" | "EXPIRED") => {
-                    job.status = BuildStatus::Failed;
-                    job.failure_message = Some(
-                        snapshot
-                            .status_detail
-                            .unwrap_or_else(|| format!("Cloud Build reported status {}", snapshot.status.unwrap_or_else(|| "UNKNOWN".into()))),
+                Err(error) => {
+                    consecutive_poll_errors = consecutive_poll_errors.saturating_add(1);
+                    info!(
+                        build_id = %job.build_id,
+                        cloud_build_id = ?job.cloud_build_id,
+                        attempt = consecutive_poll_errors,
+                        error = %error,
+                        "Cloud build status poll failed; retrying"
                     );
-                    return Ok(job);
+
+                    if consecutive_poll_errors >= 5 {
+                        return Err(error);
+                    }
+
+                    sleep(poll_interval).await;
+                    continue;
                 }
-                Some(status) => {
+            };
+
+            if let Some(snapshot) = poll_state.snapshot {
+                job.cloud_build_id = snapshot.id.or(job.cloud_build_id.clone());
+                job.cloud_build_name = snapshot.name.or(job.cloud_build_name.clone());
+                job.cloud_build_log_url = snapshot.log_url.or(job.cloud_build_log_url.clone());
+
+                if !poll_state.done {
+                    let status = snapshot.status.unwrap_or_else(|| "UNKNOWN".into());
                     info!(
                         build_id = %job.build_id,
                         cloud_build_status = %status,
                         cloud_build_id = ?job.cloud_build_id,
+                        cloud_build_operation_name = ?job.cloud_build_operation_name,
                         "Cloud build still running"
                     );
                     self.store_job(job.clone()).await;
                     sleep(poll_interval).await;
+                    continue;
                 }
-                None => {
-                    info!(
-                        build_id = %job.build_id,
-                        cloud_build_id = ?job.cloud_build_id,
-                        "Cloud build snapshot missing status; retrying"
-                    );
-                    self.store_job(job.clone()).await;
-                    sleep(poll_interval).await;
+
+                match snapshot.status.as_deref() {
+                    Some("SUCCESS") => {
+                        job.status = BuildStatus::Ready;
+                        job.failure_message = None;
+                        return Ok(job);
+                    }
+                    Some("FAILURE" | "INTERNAL_ERROR" | "TIMEOUT" | "CANCELLED" | "EXPIRED") => {
+                        job.status = BuildStatus::Failed;
+                        job.failure_message = Some(
+                            snapshot
+                                .status_detail
+                                .unwrap_or_else(|| format!("Cloud Build reported status {}", snapshot.status.unwrap_or_else(|| "UNKNOWN".into()))),
+                        );
+                        return Ok(job);
+                    }
+                    Some(status) => {
+                        job.status = BuildStatus::Failed;
+                        job.failure_message = Some(format!(
+                            "Cloud Build operation completed with unexpected status {status}"
+                        ));
+                        return Ok(job);
+                    }
+                    None => {
+                        if let Some(error_message) = poll_state.error_message {
+                            job.status = BuildStatus::Failed;
+                            job.failure_message = Some(error_message);
+                            return Ok(job);
+                        }
+
+                        job.status = BuildStatus::Failed;
+                        job.failure_message = Some(
+                            "Cloud Build operation completed without a build status".into(),
+                        );
+                        return Ok(job);
+                    }
                 }
             }
+
+            if !poll_state.done {
+                info!(
+                    build_id = %job.build_id,
+                    cloud_build_id = ?job.cloud_build_id,
+                    cloud_build_operation_name = ?job.cloud_build_operation_name,
+                    "Cloud build operation still running without build snapshot"
+                );
+                self.store_job(job.clone()).await;
+                sleep(poll_interval).await;
+                continue;
+            }
+
+            if let Some(error_message) = poll_state.error_message {
+                job.status = BuildStatus::Failed;
+                job.failure_message = Some(error_message);
+                return Ok(job);
+            }
+
+            job.status = BuildStatus::Failed;
+            job.failure_message = Some(
+                "Cloud Build operation completed without a build payload".into(),
+            );
+            return Ok(job);
         }
+    }
+
+    async fn fetch_cloud_build_state(&self, job: &BuildJob) -> Result<CloudBuildPollState, AppError> {
+        if job.cloud_build_name.is_some() {
+            let snapshot = self.fetch_cloud_build_snapshot(job).await?;
+            let done = snapshot
+                .status
+                .as_deref()
+                .is_some_and(is_terminal_cloud_build_status);
+
+            return Ok(CloudBuildPollState {
+                snapshot: Some(snapshot),
+                done,
+                error_message: None,
+            });
+        }
+
+        if let Some(operation_name) = job.cloud_build_operation_name.as_deref() {
+            return self.fetch_cloud_build_operation_state(operation_name).await;
+        }
+
+        let snapshot = self.fetch_cloud_build_snapshot(job).await?;
+        Ok(CloudBuildPollState {
+            snapshot: Some(snapshot),
+            done: false,
+            error_message: None,
+        })
+    }
+
+    async fn fetch_cloud_build_operation_state(
+        &self,
+        operation_name: &str,
+    ) -> Result<CloudBuildPollState, AppError> {
+        let endpoint = build_cloud_build_operation_get_endpoint(operation_name)?;
+        let payload = self
+            .cloud_build_get_json(endpoint, "Cloud Build operation status query")
+            .await?;
+
+        Ok(CloudBuildPollState {
+            snapshot: CloudBuildSnapshot::from_value(&payload),
+            done: payload
+                .get("done")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            error_message: payload
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string),
+        })
     }
 
     async fn fetch_cloud_build_snapshot(&self, job: &BuildJob) -> Result<CloudBuildSnapshot, AppError> {
@@ -527,8 +637,20 @@ impl BuildsService {
             job.cloud_build_name.as_deref(),
             job.cloud_build_id.as_deref(),
         )?;
+        let payload = self
+            .cloud_build_get_json(endpoint, "Cloud Build status query")
+            .await?;
 
-        let access_token = gcp_auth::provider()
+        CloudBuildSnapshot::from_value(&payload).ok_or_else(|| {
+            AppError::Internal(format!(
+                "Cloud Build status response did not contain the expected fields. Body: {}",
+                truncate_for_log(&payload.to_string())
+            ))
+        })
+    }
+
+    async fn cloud_build_access_token(&self) -> Result<String, AppError> {
+        let token = gcp_auth::provider()
             .await
             .map_err(|error| AppError::Internal(format!("Failed to initialize GCP auth: {error}")))?
             .token(&["https://www.googleapis.com/auth/cloud-platform"])
@@ -537,31 +659,45 @@ impl BuildsService {
                 AppError::Internal(format!("Failed to obtain Cloud Build token: {error}"))
             })?;
 
+        Ok(token.as_str().to_string())
+    }
+
+    async fn cloud_build_get_json(
+        &self,
+        endpoint: Url,
+        request_label: &str,
+    ) -> Result<Value, AppError> {
+        let access_token = self.cloud_build_access_token().await?;
+
         let response = self
             .http_client
             .get(endpoint)
-            .bearer_auth(access_token.as_str())
+            .bearer_auth(access_token)
             .send()
             .await
-            .map_err(|error| {
-                AppError::Internal(format!("Failed to query Cloud Build status: {error}"))
-            })?;
+            .map_err(|error| AppError::Internal(format!("Failed to query {request_label}: {error}")))?;
 
         let status = response.status();
-        let payload = response
-            .json::<CloudBuildSnapshot>()
+        let body = response
+            .text()
             .await
             .map_err(|error| {
-                AppError::Internal(format!("Failed to decode Cloud Build status response: {error}"))
+                AppError::Internal(format!("Failed to read {request_label} response body: {error}"))
             })?;
 
         if !status.is_success() {
             return Err(AppError::Internal(format!(
-                "Cloud Build status query failed with HTTP {status}"
+                "{request_label} failed with HTTP {status}: {}",
+                truncate_for_log(&body)
             )));
         }
 
-        Ok(payload)
+        serde_json::from_str(&body).map_err(|error| {
+            AppError::Internal(format!(
+                "Failed to decode {request_label} response: {error}. Body: {}",
+                truncate_for_log(&body)
+            ))
+        })
     }
 
     async fn validate_source_archive_path(&self, value: &str) -> Result<(), AppError> {
@@ -691,6 +827,47 @@ struct CloudBuildSnapshot {
     status_detail: Option<String>,
     #[serde(rename = "logUrl")]
     log_url: Option<String>,
+}
+
+#[derive(Debug)]
+struct CloudBuildPollState {
+    snapshot: Option<CloudBuildSnapshot>,
+    done: bool,
+    error_message: Option<String>,
+}
+
+impl CloudBuildSnapshot {
+    fn from_value(value: &Value) -> Option<Self> {
+        let mut candidates = vec![value];
+        if let Some(response) = value.get("response") {
+            candidates.push(response);
+            if let Some(build) = response.get("build") {
+                candidates.push(build);
+            }
+        }
+        if let Some(build) = value.get("build") {
+            candidates.push(build);
+        }
+        if let Some(build) = value.get("metadata").and_then(|metadata| metadata.get("build")) {
+            candidates.push(build);
+        }
+
+        for candidate in candidates {
+            let snapshot = Self {
+                id: json_string(candidate, &["id"]),
+                name: json_string(candidate, &["name"]),
+                status: json_string(candidate, &["status"]),
+                status_detail: json_string(candidate, &["statusDetail"]),
+                log_url: json_string(candidate, &["logUrl"]),
+            };
+
+            if snapshot.id.is_some() || snapshot.name.is_some() || snapshot.status.is_some() {
+                return Some(snapshot);
+            }
+        }
+
+        None
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -826,18 +1003,15 @@ fn build_cloud_build_get_endpoint(
     validate_gcp_project_id(project_id)?;
     validate_gcp_region(region)?;
 
-    let mut endpoint = Url::parse(CLOUD_BUILD_API_BASE_URL)
-        .map_err(|error| AppError::Internal(format!("Invalid Cloud Build base URL: {error}")))?;
-
-    let path_segments: Vec<String> = if let Some(name) = build_name {
-        let trimmed = name.trim().trim_matches('/');
-        if trimmed.is_empty() {
+    let (path_segments, resolved_build_id): (Vec<String>, String) = if let Some(name) = build_name {
+        let segments = normalize_cloud_build_resource_name(name, "Cloud Build name")?;
+        let Some(last_segment) = segments.last().cloned() else {
             return Err(AppError::Internal(
-                "Cloud Build name must not be empty when provided".into(),
+                "Cloud Build name did not contain a build id".into(),
             ));
-        }
+        };
 
-        trimmed.split('/').map(str::to_string).collect()
+        (segments, last_segment)
     } else if let Some(id) = build_id {
         let trimmed = id.trim();
         if trimmed.is_empty() {
@@ -846,20 +1020,49 @@ fn build_cloud_build_get_endpoint(
             ));
         }
 
-        vec![
-            "v1".into(),
-            "projects".into(),
-            project_id.into(),
-            "locations".into(),
-            region.into(),
-            "builds".into(),
+        (
+            vec![
+                "v1".into(),
+                "projects".into(),
+                project_id.into(),
+                "locations".into(),
+                region.into(),
+                "builds".into(),
+                trimmed.into(),
+            ],
             trimmed.into(),
-        ]
+        )
     } else {
         return Err(AppError::Internal(
             "Cloud build tracking requires either a build name or a build id".into(),
         ));
     };
+
+    let mut endpoint = Url::parse(CLOUD_BUILD_API_BASE_URL)
+        .map_err(|error| AppError::Internal(format!("Invalid Cloud Build base URL: {error}")))?;
+
+    {
+        let mut segments = endpoint.path_segments_mut().map_err(|_| {
+            AppError::Internal("Cloud Build base URL cannot accept path segments".into())
+        })?;
+        segments.extend(path_segments);
+    }
+
+    endpoint
+        .query_pairs_mut()
+        .append_pair("projectId", project_id)
+        .append_pair("id", &resolved_build_id);
+
+    Ok(endpoint)
+}
+
+fn build_cloud_build_operation_get_endpoint(operation_name: &str) -> Result<Url, AppError> {
+    let mut endpoint = Url::parse(CLOUD_BUILD_API_BASE_URL)
+        .map_err(|error| AppError::Internal(format!("Invalid Cloud Build base URL: {error}")))?;
+    let path_segments = normalize_cloud_build_resource_name(
+        operation_name,
+        "Cloud Build operation name",
+    )?;
 
     {
         let mut segments = endpoint.path_segments_mut().map_err(|_| {
@@ -869,6 +1072,23 @@ fn build_cloud_build_get_endpoint(
     }
 
     Ok(endpoint)
+}
+
+fn normalize_cloud_build_resource_name(
+    value: &str,
+    label: &str,
+) -> Result<Vec<String>, AppError> {
+    let trimmed = value.trim().trim_matches('/');
+    if trimmed.is_empty() {
+        return Err(AppError::Internal(format!("{label} must not be empty")));
+    }
+
+    let mut segments: Vec<String> = trimmed.split('/').map(str::to_string).collect();
+    if segments.first().map(String::as_str) != Some("v1") {
+        segments.insert(0, "v1".into());
+    }
+
+    Ok(segments)
 }
 
 fn app_error_message(error: &AppError) -> String {
@@ -944,6 +1164,34 @@ fn metadata_string(metadata: Option<&Value>, path: &[&str]) -> Option<String> {
     current.as_str().map(ToString::to_string)
 }
 
+fn json_string(value: &Value, path: &[&str]) -> Option<String> {
+    let mut current = value;
+
+    for segment in path {
+        current = current.get(*segment)?;
+    }
+
+    current.as_str().map(ToString::to_string)
+}
+
+fn truncate_for_log(value: &str) -> String {
+    const MAX_LEN: usize = 400;
+
+    let trimmed = value.trim();
+    if trimmed.len() <= MAX_LEN {
+        trimmed.to_string()
+    } else {
+        format!("{}...", &trimmed[..MAX_LEN])
+    }
+}
+
+fn is_terminal_cloud_build_status(status: &str) -> bool {
+    matches!(
+        status,
+        "SUCCESS" | "FAILURE" | "INTERNAL_ERROR" | "TIMEOUT" | "CANCELLED" | "EXPIRED"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -962,8 +1210,9 @@ mod tests {
     };
 
     use super::{
-        build_cloud_build_endpoint, build_cloud_build_get_endpoint, normalized_service_account, parse_gcs_uri,
-        validate_gcp_project_id, validate_gcp_region, BuildsService,
+        build_cloud_build_endpoint, build_cloud_build_get_endpoint, build_cloud_build_operation_get_endpoint,
+        normalized_service_account, parse_gcs_uri, validate_gcp_project_id, validate_gcp_region,
+        BuildsService,
     };
 
     async fn wait_for_build_status(
@@ -1210,14 +1459,14 @@ mod tests {
         let endpoint = build_cloud_build_get_endpoint(
             "altair-isen",
             "europe-west9",
-            Some("v1/projects/altair-isen/locations/europe-west9/builds/123"),
+            Some("projects/390873516222/locations/europe-west9/builds/123"),
             None,
         )
         .expect("endpoint should be valid");
 
         assert_eq!(
             endpoint.as_str(),
-            "https://cloudbuild.googleapis.com/v1/projects/altair-isen/locations/europe-west9/builds/123"
+            "https://cloudbuild.googleapis.com/v1/projects/390873516222/locations/europe-west9/builds/123?projectId=altair-isen&id=123"
         );
     }
 
@@ -1233,7 +1482,20 @@ mod tests {
 
         assert_eq!(
             endpoint.as_str(),
-            "https://cloudbuild.googleapis.com/v1/projects/altair-isen/locations/europe-west9/builds/123"
+            "https://cloudbuild.googleapis.com/v1/projects/altair-isen/locations/europe-west9/builds/123?projectId=altair-isen&id=123"
+        );
+    }
+
+    #[test]
+    fn build_cloud_build_operation_get_endpoint_accepts_operation_name_without_v1() {
+        let endpoint = build_cloud_build_operation_get_endpoint(
+            "operations/build/altair-isen/NmMyNDEwYTItMzBhZC00ZmJmLWE2NzEtZTYwMGEzYjVlODE0",
+        )
+        .expect("operation endpoint should be valid");
+
+        assert_eq!(
+            endpoint.as_str(),
+            "https://cloudbuild.googleapis.com/v1/operations/build/altair-isen/NmMyNDEwYTItMzBhZC00ZmJmLWE2NzEtZTYwMGEzYjVlODE0"
         );
     }
 }

@@ -1,4 +1,5 @@
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::trace::TraceLayer;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 
@@ -27,7 +28,10 @@ async fn main() {
         .allow_methods(Any)
         .allow_headers(Any);
 
-    let app = routes::init_routes().layer(cors).with_state(state);
+    let app = routes::init_routes()
+        .layer(TraceLayer::new_for_http())
+        .layer(cors)
+        .with_state(state);
 
     let port = std::env::var("PORT").unwrap_or_else(|_| DEFAULT_PORT.to_string());
     let addr = format!("0.0.0.0:{port}");
