@@ -1,3 +1,28 @@
+/**
+ * @file source_bundle — source upload and packaging models.
+ *
+ * @remarks
+ * Defines the structures used to represent uploaded lab sources,
+ * their packaging into bundles, and their linkage to build jobs.
+ *
+ * Includes:
+ *
+ *  - Individual uploaded files (`UploadedFile`)
+ *  - Aggregated source bundle metadata (`SourceBundle`)
+ *  - Combined response for upload + build trigger (`BuildFromUploadResponse`)
+ *
+ * Key characteristics:
+ *
+ *  - Tracks all files included in a bundle (path, size)
+ *  - Provides archive metadata (size, count, storage paths)
+ *  - Bridges upload step with build pipeline execution
+ *
+ * This module enables the transition from raw user uploads
+ * to reproducible build inputs within the Lab Builder system.
+ *
+ * @packageDocumentation
+ */
+
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 use uuid::Uuid;

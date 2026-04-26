@@ -1,3 +1,25 @@
+/**
+ * @file api — standard API models.
+ *
+ * @remarks
+ * Defines the unified response format used across the Lab Builder service:
+ *
+ *  - Success responses (`ApiResponse<T>`)
+ *  - Error responses (`ApiErrorResponse`)
+ *  - Metadata (`ApiMeta`)
+ *
+ * Key characteristics:
+ *
+ *  - Consistent API structure (success, data, meta)
+ *  - Structured error handling (code, message, details)
+ *  - Automatic metadata generation (request_id, timestamp)
+ *
+ * This module is shared across all endpoints to ensure a predictable
+ * and standardized API contract for frontend and gateway integration.
+ *
+ * @packageDocumentation
+ */
+
 use serde::Serialize;
 
 #[derive(Serialize)]

@@ -1,3 +1,40 @@
+/**
+ * @file builds — build orchestration service.
+ *
+ * @remarks
+ * Implements the core logic for creating, executing, and tracking
+ * lab build jobs across different execution environments.
+ *
+ * Responsibilities:
+ *
+ *  - Build job creation and validation (`create_build`)
+ *  - Local build execution (Docker + Kind)
+ *  - Cloud build submission (Google Cloud Build)
+ *  - Asynchronous job tracking and state updates
+ *
+ * Key features:
+ *
+ *  - Dual execution mode:
+ *      • Local (Docker + Kind cluster)
+ *      • Cloud (GCP Cloud Build)
+ *  - Secure handling of source archives (path validation, sandboxing)
+ *  - Full lifecycle tracking (queued → submitted → ready/failed)
+ *  - Background processing using async tasks
+ *  - Integration with external services (GCP APIs, local CLI tools)
+ *
+ * Also includes:
+ *
+ *  - Helpers for GCS URI parsing and validation
+ *  - Cloud Build API request/response handling
+ *  - Command execution wrappers for local builds
+ *  - Polling logic for long-running cloud operations
+ *
+ * This service is the backbone of the Lab Builder system,
+ * transforming uploaded lab sources into runnable container images.
+ *
+ * @packageDocumentation
+ */
+
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},

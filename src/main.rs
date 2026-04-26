@@ -1,3 +1,34 @@
+/**
+ * @file main — application entry point.
+ *
+ * @remarks
+ * Bootstraps the Lab Builder service by initializing configuration,
+ * logging, middleware, and HTTP routes.
+ *
+ * Responsibilities:
+ *
+ *  - Load environment variables (`dotenv`)
+ *  - Initialize structured logging (`tracing`)
+ *  - Build application state from environment (`State::from_env`)
+ *  - Configure middleware:
+ *      • CORS (allow all origins, methods, headers)
+ *      • HTTP request tracing
+ *  - Register routes and attach shared state
+ *  - Start the HTTP server on the configured port
+ *
+ * Key characteristics:
+ *
+ *  - Async runtime powered by Tokio
+ *  - Modular architecture (routes, services, models)
+ *  - Observability via tracing logs
+ *  - Environment-driven configuration
+ *
+ * This module is the entry point of the service,
+ * responsible for wiring all components together and starting the server.
+ *
+ * @packageDocumentation
+ */
+
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::trace::TraceLayer;
 use tracing::info;

@@ -1,3 +1,28 @@
+/**
+ * @file builds — HTTP routes for build management.
+ *
+ * @remarks
+ * Exposes endpoints for creating and retrieving build jobs
+ * within the Lab Builder service.
+ *
+ * Endpoints:
+ *
+ *  - `POST /builds` → create a new build job
+ *  - `GET /builds/:build_id` → retrieve an existing build job
+ *
+ * Key characteristics:
+ *
+ *  - Delegates business logic to `BuildsService`
+ *  - Uses unified API response format (`ApiResponse<T>`)
+ *  - Handles request validation via typed payloads
+ *  - Returns structured errors through `AppError`
+ *
+ * This module acts as the HTTP interface for the build system,
+ * connecting external clients (frontend, gateway) to the build pipeline.
+ *
+ * @packageDocumentation
+ */
+
 use axum::{
     extract::{Path, State},
     Json,

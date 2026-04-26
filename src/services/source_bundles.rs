@@ -1,3 +1,37 @@
+/**
+ * @file source_bundles — source upload, packaging, and storage service.
+ *
+ * @remarks
+ * Handles the ingestion of user-uploaded lab files, their secure storage,
+ * and their transformation into build-ready source bundles.
+ *
+ * Responsibilities:
+ *
+ *  - Persist uploaded files into a controlled workspace
+ *  - Sanitize and validate file paths to prevent traversal attacks
+ *  - Package files into a `.tar.gz` archive for build consumption
+ *  - Generate metadata describing the bundle (files, size, paths)
+ *  - Upload archives to Google Cloud Storage (GCS)
+ *
+ * Key features:
+ *
+ *  - Secure path handling (relative-only, no traversal)
+ *  - Isolated workspace per bundle (UUID-based)
+ *  - Reproducible build context via archive generation
+ *  - Integration with GCS for remote build pipelines
+ *
+ * Also includes:
+ *
+ *  - Archive creation utilities (tar + gzip)
+ *  - GCS upload logic with authenticated requests
+ *  - Path sanitization helpers for uploaded files
+ *
+ * This service is the entry point of the build pipeline,
+ * converting raw user input into structured and secure build artifacts.
+ *
+ * @packageDocumentation
+ */
+
 use std::{
     path::{Component, Path, PathBuf},
     sync::Arc,

@@ -1,3 +1,36 @@
+/**
+ * @file source_bundles — HTTP routes for source upload and build triggering.
+ *
+ * @remarks
+ * Exposes endpoints for handling multipart uploads of lab sources
+ * and optionally triggering build jobs from those uploads.
+ *
+ * Endpoints:
+ *
+ *  - `POST /source-bundles` → create a source bundle from uploaded files
+ *  - `POST /builds/from-upload` → upload files and immediately trigger a build
+ *
+ * Key characteristics:
+ *
+ *  - Parses multipart form-data (files + metadata fields)
+ *  - Supports flexible input (lab_id, lab_name, or image_name)
+ *  - Automatically derives a valid image name when not provided
+ *  - Integrates with both `SourceBundlesService` and `BuildsService`
+ *  - Adapts behavior depending on execution mode (local vs cloud)
+ *
+ * Features:
+ *
+ *  - Secure handling of uploaded files (delegated to service layer)
+ *  - Automatic packaging into build-ready archives
+ *  - Optional upload to GCS when running in cloud mode
+ *  - Unified API responses (`ApiResponse<T>`)
+ *
+ * This module acts as the entry point for user-provided lab content,
+ * bridging file uploads with the build pipeline in a single flow.
+ *
+ * @packageDocumentation
+ */
+
 use axum::{
     extract::{Multipart, State},
     Json,

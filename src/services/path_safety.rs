@@ -1,3 +1,29 @@
+/**
+ * @file path_safety — secure filesystem path handling utilities.
+ *
+ * @remarks
+ * Provides helper functions to safely manipulate and validate filesystem paths
+ * within the Lab Builder workspace, preventing path traversal and unauthorized access.
+ *
+ * Includes:
+ *
+ *  - Root directory initialization and validation (`ensure_builder_root_dir`)
+ *  - Safe path joining within a restricted root (`join_relative_to_root`)
+ *  - Resolution and validation of existing paths (`resolve_existing_path_within_root`)
+ *
+ * Key characteristics:
+ *
+ *  - Enforces strict confinement to a predefined root directory
+ *  - Prevents directory traversal attacks (e.g. `../`)
+ *  - Requires absolute and canonicalized paths for critical operations
+ *  - Ensures all accessed files exist and are within the allowed workspace
+ *
+ * This module is critical for securing file operations in the build pipeline,
+ * especially when handling user-provided paths and uploaded archives.
+ *
+ * @packageDocumentation
+ */
+
 use std::path::{Path, PathBuf};
 
 use tokio::fs;

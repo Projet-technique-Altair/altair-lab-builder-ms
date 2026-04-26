@@ -1,3 +1,30 @@
+/**
+ * @file build — build job models and lifecycle definitions.
+ *
+ * @remarks
+ * Defines all structures related to the build pipeline of labs,
+ * from creation requests to execution tracking and final artifacts.
+ *
+ * Includes:
+ *
+ *  - Build lifecycle states (`BuildStatus`)
+ *  - Build execution strategies (`BuildDispatchMode`)
+ *  - Build creation payload (`CreateBuildRequest`)
+ *  - Persisted build job representation (`BuildJob`)
+ *
+ * Key characteristics:
+ *
+ *  - Supports multiple build backends (local Kind, Google Cloud Build)
+ *  - Tracks full build lifecycle (queued → ready/failed)
+ *  - Stores metadata for debugging and observability (logs, IDs, errors)
+ *  - Handles image versioning (latest + versioned URIs)
+ *
+ * This module is central to the lab build system, enabling
+ * asynchronous build execution and traceability across infrastructure.
+ *
+ * @packageDocumentation
+ */
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;

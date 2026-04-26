@@ -1,3 +1,30 @@
+/**
+ * @file routes — application route registration.
+ *
+ * @remarks
+ * Defines and registers all HTTP routes exposed by the Lab Builder service,
+ * mapping endpoints to their corresponding handlers.
+ *
+ * Registered routes:
+ *
+ *  - `GET /health` → service health check
+ *  - `POST /builds` → create a build job
+ *  - `POST /builds/from-upload` → upload sources and trigger a build
+ *  - `GET /builds/{build_id}` → retrieve a build job
+ *  - `POST /source-bundles` → create a source bundle from uploaded files
+ *
+ * Key characteristics:
+ *
+ *  - Centralized routing configuration
+ *  - Uses shared application state (`State`)
+ *  - Connects HTTP layer to route handlers
+ *
+ * This module acts as the entry point for all API endpoints,
+ * assembling the router used by the application server.
+ *
+ * @packageDocumentation
+ */
+
 use axum::{
     routing::{get, post},
     Router,

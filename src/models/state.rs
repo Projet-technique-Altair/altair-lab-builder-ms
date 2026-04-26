@@ -1,3 +1,32 @@
+/**
+ * @file state — application state and configuration.
+ *
+ * @remarks
+ * Defines the global application state for the Lab Builder service,
+ * including configuration and service initialization.
+ *
+ * Includes:
+ *
+ *  - Runtime configuration (`BuilderConfig`)
+ *  - Shared application state (`State`)
+ *  - Environment-based configuration loading
+ *
+ * Key characteristics:
+ *
+ *  - Centralizes all infrastructure and build-related configuration
+ *  - Supports both local and cloud execution modes
+ *  - Initializes core services (builds, source bundles)
+ *  - Uses thread-safe shared state for build job tracking
+ *
+ * Configuration is primarily sourced from environment variables,
+ * with sensible defaults to allow local development and testing.
+ *
+ * This module acts as the entry point for dependency wiring
+ * across the Lab Builder service.
+ *
+ * @packageDocumentation
+ */
+
 use std::{collections::HashMap, sync::Arc};
 
 use tokio::sync::RwLock;
