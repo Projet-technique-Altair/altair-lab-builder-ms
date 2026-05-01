@@ -31,7 +31,6 @@
  *
  * @packageDocumentation
  */
-
 use std::{
     path::{Component, Path, PathBuf},
     sync::Arc,
@@ -72,6 +71,22 @@ impl SourceBundlesService {
             config: Arc::new(config),
             http_client: Client::new(),
         }
+    }
+
+    pub fn max_upload_files(&self) -> usize {
+        self.config.max_upload_files
+    }
+
+    pub fn max_upload_file_bytes(&self) -> usize {
+        self.config.max_upload_file_bytes
+    }
+
+    pub fn max_upload_total_bytes(&self) -> usize {
+        self.config.max_upload_total_bytes
+    }
+
+    pub fn max_text_field_bytes(&self) -> usize {
+        self.config.max_text_field_bytes
     }
 
     pub async fn create_source_bundle(

@@ -21,7 +21,6 @@
  *
  * @packageDocumentation
  */
-
 use axum::{extract::State, Json};
 use serde_json::json;
 

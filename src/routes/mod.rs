@@ -24,7 +24,6 @@
  *
  * @packageDocumentation
  */
-
 use axum::{
     routing::{get, post},
     Router,

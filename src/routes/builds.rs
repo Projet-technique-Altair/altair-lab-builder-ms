@@ -22,7 +22,6 @@
  *
  * @packageDocumentation
  */
-
 use axum::{
     extract::{Path, State},
     Json,

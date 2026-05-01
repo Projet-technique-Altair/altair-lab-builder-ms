@@ -34,7 +34,6 @@
  *
  * @packageDocumentation
  */
-
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
@@ -47,7 +46,12 @@ use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tar::Archive;
-use tokio::{fs, process::Command, sync::RwLock, time::{sleep, Duration}};
+use tokio::{
+    fs,
+    process::Command,
+    sync::{OwnedSemaphorePermit, RwLock, Semaphore},
+    time::{sleep, Duration},
+};
 use tracing::info;
 use uuid::Uuid;
 
@@ -57,7 +61,9 @@ use crate::{
         build::{BuildDispatchMode, BuildJob, BuildStatus, CreateBuildRequest},
         state::BuilderConfig,
     },
-    services::path_safety::{ensure_builder_root_dir, join_relative_to_root, resolve_existing_path_within_root},
+    services::path_safety::{
+        ensure_builder_root_dir, join_relative_to_root, resolve_existing_path_within_root,
+    },
 };
 
 const CLOUD_BUILD_API_BASE_URL: &str = "https://cloudbuild.googleapis.com/";
@@ -67,14 +73,20 @@ pub struct BuildsService {
     config: BuilderConfig,
     jobs: Arc<RwLock<HashMap<Uuid, BuildJob>>>,
     http_client: Client,
+    build_slots: Arc<Semaphore>,
 }
 
 impl BuildsService {
-    pub fn new(config: BuilderConfig, jobs: Arc<RwLock<HashMap<Uuid, BuildJob>>>) -> Self {
+    pub fn new(
+        config: BuilderConfig,
+        jobs: Arc<RwLock<HashMap<Uuid, BuildJob>>>,
+        build_slots: Arc<Semaphore>,
+    ) -> Self {
         Self {
             config,
             jobs,
             http_client: Client::new(),
+            build_slots,
         }
     }
 
@@ -168,8 +180,9 @@ impl BuildsService {
         };
 
         if self.config.local_mode {
+            let permit = self.acquire_build_slot()?;
             self.store_job(job.clone()).await;
-            self.spawn_local_build(job.clone());
+            self.spawn_local_build(job.clone(), permit);
             info!(
                 build_id = %job.build_id,
                 status = ?job.status,
@@ -179,6 +192,7 @@ impl BuildsService {
             return Ok(job);
         }
 
+        let permit = self.acquire_build_slot()?;
         let job = self.submit_to_cloud_build(job).await?;
         info!(
             build_id = %job.build_id,
@@ -192,7 +206,7 @@ impl BuildsService {
         );
 
         self.store_job(job.clone()).await;
-        self.spawn_cloud_build_tracking(job.clone());
+        self.spawn_cloud_build_tracking(job.clone(), permit);
         Ok(job)
     }
 
@@ -209,10 +223,18 @@ impl BuildsService {
         self.jobs.write().await.insert(job.build_id, job);
     }
 
-    fn spawn_local_build(&self, job: BuildJob) {
+    fn acquire_build_slot(&self) -> Result<OwnedSemaphorePermit, AppError> {
+        self.build_slots
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| AppError::BadRequest("Too many builds are already running".into()))
+    }
+
+    fn spawn_local_build(&self, job: BuildJob, permit: OwnedSemaphorePermit) {
         let service = self.clone();
 
         tokio::spawn(async move {
+            let _permit = permit;
             let result = service.build_and_load_locally(job.clone()).await;
 
             match result {
@@ -241,10 +263,11 @@ impl BuildsService {
         });
     }
 
-    fn spawn_cloud_build_tracking(&self, job: BuildJob) {
+    fn spawn_cloud_build_tracking(&self, job: BuildJob, permit: OwnedSemaphorePermit) {
         let service = self.clone();
 
         tokio::spawn(async move {
+            let _permit = permit;
             let result = service.track_cloud_build(job.clone()).await;
 
             match result {
@@ -360,7 +383,8 @@ impl BuildsService {
         build_id: Uuid,
     ) -> Result<PathBuf, AppError> {
         let root_dir = ensure_builder_root_dir(&self.config.bundle_root_dir).await?;
-        let local_contexts_dir = join_relative_to_root(&root_dir, Path::new("local-build-contexts"))?;
+        let local_contexts_dir =
+            join_relative_to_root(&root_dir, Path::new("local-build-contexts"))?;
         let build_id_string = build_id.to_string();
         let destination = join_relative_to_root(&local_contexts_dir, Path::new(&build_id_string))?;
 
@@ -380,6 +404,8 @@ impl BuildsService {
 
         let archive_path = archive_path.to_path_buf();
         let destination_clone = destination.clone();
+        let max_archive_entries = self.config.max_archive_entries;
+        let max_archive_uncompressed_bytes = self.config.max_archive_uncompressed_bytes;
         tokio::task::spawn_blocking(move || -> Result<(), AppError> {
             info!(
                 archive_path = %archive_path.display(),
@@ -391,9 +417,59 @@ impl BuildsService {
             })?;
             let decoder = GzDecoder::new(archive_file);
             let mut archive = Archive::new(decoder);
-            archive.unpack(&destination_clone).map_err(|error| {
-                AppError::Internal(format!("Failed to extract local source archive: {error}"))
-            })?;
+            let mut entry_count = 0_usize;
+            let mut uncompressed_bytes = 0_u64;
+
+            for entry in archive.entries().map_err(|error| {
+                AppError::Internal(format!("Failed to read local source archive: {error}"))
+            })? {
+                let mut entry = entry.map_err(|error| {
+                    AppError::Internal(format!("Failed to read local source archive entry: {error}"))
+                })?;
+
+                entry_count = entry_count.saturating_add(1);
+                if entry_count > max_archive_entries {
+                    return Err(AppError::BadRequest(
+                        "Source archive contains too many entries".into(),
+                    ));
+                }
+
+                let entry_type = entry.header().entry_type();
+                let entry_size = entry.header().size().unwrap_or(0);
+                if !(entry_type.is_file() || entry_type.is_dir()) {
+                    return Err(AppError::BadRequest(
+                        "Source archive contains unsupported entry types".into(),
+                    ));
+                }
+
+                uncompressed_bytes = uncompressed_bytes.saturating_add(entry_size);
+                if uncompressed_bytes > max_archive_uncompressed_bytes {
+                    return Err(AppError::BadRequest(
+                        "Source archive uncompressed size exceeds the configured limit".into(),
+                    ));
+                }
+
+                let path = entry.path().map_err(|error| {
+                    AppError::BadRequest(format!("Source archive entry has an invalid path: {error}"))
+                })?;
+                let destination_path = join_relative_to_root(&destination_clone, path.as_ref())?;
+                drop(path);
+
+                if entry_type.is_dir() {
+                    std::fs::create_dir_all(&destination_path).map_err(|error| {
+                        AppError::Internal(format!("Failed to create archive directory: {error}"))
+                    })?;
+                } else {
+                    if let Some(parent) = destination_path.parent() {
+                        std::fs::create_dir_all(parent).map_err(|error| {
+                            AppError::Internal(format!("Failed to create archive parent directory: {error}"))
+                        })?;
+                    }
+                    entry.unpack(&destination_path).map_err(|error| {
+                        AppError::Internal(format!("Failed to extract local source archive entry: {error}"))
+                    })?;
+                }
+            }
             info!(
                 archive_path = %archive_path.display(),
                 destination = %destination_clone.display(),
@@ -463,10 +539,8 @@ impl BuildsService {
         let build_request = self.build_cloud_build_request(&job, &source);
         let access_token = self.cloud_build_access_token().await?;
 
-        let endpoint = build_cloud_build_endpoint(
-            &self.config.gcp_project_id,
-            &self.config.gcp_region,
-        )?;
+        let endpoint =
+            build_cloud_build_endpoint(&self.config.gcp_project_id, &self.config.gcp_region)?;
 
         let response = self
             .http_client
@@ -506,7 +580,8 @@ impl BuildsService {
     }
 
     async fn track_cloud_build(&self, mut job: BuildJob) -> Result<BuildJob, AppError> {
-        let poll_interval = Duration::from_secs(self.config.cloud_build_poll_interval_seconds.max(1));
+        let poll_interval =
+            Duration::from_secs(self.config.cloud_build_poll_interval_seconds.max(1));
         let mut consecutive_poll_errors = 0u8;
 
         loop {
@@ -561,11 +636,12 @@ impl BuildsService {
                     }
                     Some("FAILURE" | "INTERNAL_ERROR" | "TIMEOUT" | "CANCELLED" | "EXPIRED") => {
                         job.status = BuildStatus::Failed;
-                        job.failure_message = Some(
-                            snapshot
-                                .status_detail
-                                .unwrap_or_else(|| format!("Cloud Build reported status {}", snapshot.status.unwrap_or_else(|| "UNKNOWN".into()))),
-                        );
+                        job.failure_message = Some(snapshot.status_detail.unwrap_or_else(|| {
+                            format!(
+                                "Cloud Build reported status {}",
+                                snapshot.status.unwrap_or_else(|| "UNKNOWN".into())
+                            )
+                        }));
                         return Ok(job);
                     }
                     Some(status) => {
@@ -583,9 +659,8 @@ impl BuildsService {
                         }
 
                         job.status = BuildStatus::Failed;
-                        job.failure_message = Some(
-                            "Cloud Build operation completed without a build status".into(),
-                        );
+                        job.failure_message =
+                            Some("Cloud Build operation completed without a build status".into());
                         return Ok(job);
                     }
                 }
@@ -610,14 +685,16 @@ impl BuildsService {
             }
 
             job.status = BuildStatus::Failed;
-            job.failure_message = Some(
-                "Cloud Build operation completed without a build payload".into(),
-            );
+            job.failure_message =
+                Some("Cloud Build operation completed without a build payload".into());
             return Ok(job);
         }
     }
 
-    async fn fetch_cloud_build_state(&self, job: &BuildJob) -> Result<CloudBuildPollState, AppError> {
+    async fn fetch_cloud_build_state(
+        &self,
+        job: &BuildJob,
+    ) -> Result<CloudBuildPollState, AppError> {
         if job.cloud_build_name.is_some() {
             let snapshot = self.fetch_cloud_build_snapshot(job).await?;
             let done = snapshot
@@ -667,7 +744,10 @@ impl BuildsService {
         })
     }
 
-    async fn fetch_cloud_build_snapshot(&self, job: &BuildJob) -> Result<CloudBuildSnapshot, AppError> {
+    async fn fetch_cloud_build_snapshot(
+        &self,
+        job: &BuildJob,
+    ) -> Result<CloudBuildSnapshot, AppError> {
         let endpoint = build_cloud_build_get_endpoint(
             &self.config.gcp_project_id,
             &self.config.gcp_region,
@@ -712,15 +792,16 @@ impl BuildsService {
             .bearer_auth(access_token)
             .send()
             .await
-            .map_err(|error| AppError::Internal(format!("Failed to query {request_label}: {error}")))?;
+            .map_err(|error| {
+                AppError::Internal(format!("Failed to query {request_label}: {error}"))
+            })?;
 
         let status = response.status();
-        let body = response
-            .text()
-            .await
-            .map_err(|error| {
-                AppError::Internal(format!("Failed to read {request_label} response body: {error}"))
-            })?;
+        let body = response.text().await.map_err(|error| {
+            AppError::Internal(format!(
+                "Failed to read {request_label} response body: {error}"
+            ))
+        })?;
 
         if !status.is_success() {
             return Err(AppError::Internal(format!(
@@ -885,7 +966,10 @@ impl CloudBuildSnapshot {
         if let Some(build) = value.get("build") {
             candidates.push(build);
         }
-        if let Some(build) = value.get("metadata").and_then(|metadata| metadata.get("build")) {
+        if let Some(build) = value
+            .get("metadata")
+            .and_then(|metadata| metadata.get("build"))
+        {
             candidates.push(build);
         }
 
@@ -944,7 +1028,9 @@ fn validate_gcp_project_id(value: &str) -> Result<(), AppError> {
     let trimmed = value.trim();
 
     if trimmed.is_empty() {
-        return Err(AppError::Internal("GCP project id must not be empty".into()));
+        return Err(AppError::Internal(
+            "GCP project id must not be empty".into(),
+        ));
     }
 
     if !(6..=30).contains(&trimmed.len()) {
@@ -1000,11 +1086,15 @@ fn validate_gcp_region(value: &str) -> Result<(), AppError> {
         .chars()
         .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-')
     {
-        return Err(AppError::Internal("GCP region contains forbidden characters".into()));
+        return Err(AppError::Internal(
+            "GCP region contains forbidden characters".into(),
+        ));
     }
 
     if trimmed.starts_with('-') || trimmed.ends_with('-') || !trimmed.contains('-') {
-        return Err(AppError::Internal("GCP region has an invalid format".into()));
+        return Err(AppError::Internal(
+            "GCP region has an invalid format".into(),
+        ));
     }
 
     Ok(())
@@ -1096,10 +1186,8 @@ fn build_cloud_build_get_endpoint(
 fn build_cloud_build_operation_get_endpoint(operation_name: &str) -> Result<Url, AppError> {
     let mut endpoint = Url::parse(CLOUD_BUILD_API_BASE_URL)
         .map_err(|error| AppError::Internal(format!("Invalid Cloud Build base URL: {error}")))?;
-    let path_segments = normalize_cloud_build_resource_name(
-        operation_name,
-        "Cloud Build operation name",
-    )?;
+    let path_segments =
+        normalize_cloud_build_resource_name(operation_name, "Cloud Build operation name")?;
 
     {
         let mut segments = endpoint.path_segments_mut().map_err(|_| {
@@ -1111,10 +1199,7 @@ fn build_cloud_build_operation_get_endpoint(operation_name: &str) -> Result<Url,
     Ok(endpoint)
 }
 
-fn normalize_cloud_build_resource_name(
-    value: &str,
-    label: &str,
-) -> Result<Vec<String>, AppError> {
+fn normalize_cloud_build_resource_name(value: &str, label: &str) -> Result<Vec<String>, AppError> {
     let trimmed = value.trim().trim_matches('/');
     if trimmed.is_empty() {
         return Err(AppError::Internal(format!("{label} must not be empty")));
@@ -1238,8 +1323,8 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use tokio::time::{sleep, Duration, Instant};
     use tokio::sync::RwLock;
+    use tokio::time::{sleep, Duration, Instant};
 
     use crate::models::{
         build::{BuildDispatchMode, BuildStatus, CreateBuildRequest},
@@ -1247,9 +1332,9 @@ mod tests {
     };
 
     use super::{
-        build_cloud_build_endpoint, build_cloud_build_get_endpoint, build_cloud_build_operation_get_endpoint,
-        normalized_service_account, parse_gcs_uri, validate_gcp_project_id, validate_gcp_region,
-        BuildsService,
+        build_cloud_build_endpoint, build_cloud_build_get_endpoint,
+        build_cloud_build_operation_get_endpoint, normalized_service_account, parse_gcs_uri,
+        validate_gcp_project_id, validate_gcp_region, BuildsService,
     };
 
     async fn wait_for_build_status(
@@ -1415,7 +1500,8 @@ mod tests {
             .as_nanos();
         let config = test_config();
         let outside_archive = std::env::temp_dir().join(format!("outside-builder-{unique}.tar.gz"));
-        std::fs::write(&outside_archive, b"fake tar gz payload").expect("archive should be written");
+        std::fs::write(&outside_archive, b"fake tar gz payload")
+            .expect("archive should be written");
 
         let service = BuildsService::new(config, Arc::new(RwLock::new(HashMap::new())));
 
@@ -1509,13 +1595,9 @@ mod tests {
 
     #[test]
     fn build_cloud_build_get_endpoint_falls_back_to_build_id() {
-        let endpoint = build_cloud_build_get_endpoint(
-            "altair-isen",
-            "europe-west9",
-            None,
-            Some("123"),
-        )
-        .expect("endpoint should be valid");
+        let endpoint =
+            build_cloud_build_get_endpoint("altair-isen", "europe-west9", None, Some("123"))
+                .expect("endpoint should be valid");
 
         assert_eq!(
             endpoint.as_str(),

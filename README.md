@@ -336,3 +336,24 @@ lab-poc-1:v1
 ```text
 europe-west9-docker.pkg.dev/altair-isen/altair-labs/lab-poc-1:v1
 ```
+## May 2026 Security And Platform Updates
+
+- Runtime Docker image now installs only required packages with `--no-install-recommends` and runs as non-root UID `10001`.
+- The sample `examples/basic-terminal-lab` image also runs as non-root UID `10001`.
+- CORS origin handling is now allowlist-based through `ALLOWED_ORIGINS`; local defaults are `http://localhost:5173,http://localhost:3000`.
+- Cloud Build and GCS access tokens are obtained from runtime identity. Do not commit service account keys or access tokens.
+- Latest Trivy scan status for this repo: no HIGH or CRITICAL findings.
+## Builder Guardrails Update
+
+- Runtime container runs as non-root user `10001`.
+- CORS is allowlisted through `ALLOWED_ORIGINS`.
+- Trivy HIGH/CRITICAL scan is clean for this service image after the Dockerfile hardening pass.
+- Uploads and builds have application-level guardrails:
+  - `LAB_BUILDER_MAX_UPLOAD_FILES` limits files per multipart upload (`200` by default).
+  - `LAB_BUILDER_MAX_UPLOAD_FILE_BYTES` limits one uploaded file (`10485760` by default).
+  - `LAB_BUILDER_MAX_UPLOAD_TOTAL_BYTES` limits the whole upload (`52428800` by default).
+  - `LAB_BUILDER_MAX_TEXT_FIELD_BYTES` limits multipart text fields (`4096` by default).
+  - `LAB_BUILDER_MAX_CONCURRENT_BUILDS` limits local/cloud builds running at once (`2` by default).
+  - `LAB_BUILDER_MAX_ARCHIVE_ENTRIES` and `LAB_BUILDER_MAX_ARCHIVE_UNCOMPRESSED_BYTES` protect local archive extraction.
+- Local `.tar.gz` build archives are extracted entry by entry and reject unsupported archive entry types instead of blindly unpacking the archive.
+- The service stays split into `routes/`, `services/`, and `models/`; `services/builds.rs` remains the orchestration owner for Cloud Build and local Docker lifecycle.

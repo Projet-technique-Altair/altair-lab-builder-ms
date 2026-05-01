@@ -23,7 +23,6 @@
  *
  * @packageDocumentation
  */
-
 use std::path::{Path, PathBuf};
 
 use tokio::fs;
@@ -45,9 +44,9 @@ pub async fn ensure_builder_root_dir(value: &str) -> Result<PathBuf, AppError> {
         ));
     }
 
-    fs::create_dir_all(&candidate)
-        .await
-        .map_err(|error| AppError::Internal(format!("Failed to prepare builder root dir: {error}")))?;
+    fs::create_dir_all(&candidate).await.map_err(|error| {
+        AppError::Internal(format!("Failed to prepare builder root dir: {error}"))
+    })?;
 
     fs::canonicalize(&candidate)
         .await
@@ -102,7 +101,9 @@ mod tests {
 
     use tokio::fs;
 
-    use super::{ensure_builder_root_dir, join_relative_to_root, resolve_existing_path_within_root};
+    use super::{
+        ensure_builder_root_dir, join_relative_to_root, resolve_existing_path_within_root,
+    };
 
     #[test]
     fn join_relative_to_root_rejects_absolute_paths() {
@@ -126,10 +127,15 @@ mod tests {
         let root = std::env::temp_dir().join(format!("lab-builder-root-{unique}"));
         let outside = std::env::temp_dir().join(format!("lab-builder-outside-{unique}.txt"));
 
-        fs::create_dir_all(&root).await.expect("root should be created");
-        fs::write(&outside, b"outside").await.expect("outside file should be created");
+        fs::create_dir_all(&root)
+            .await
+            .expect("root should be created");
+        fs::write(&outside, b"outside")
+            .await
+            .expect("outside file should be created");
 
-        let canonical_root = ensure_builder_root_dir(root.to_str().expect("root path")).await
+        let canonical_root = ensure_builder_root_dir(root.to_str().expect("root path"))
+            .await
             .expect("root should resolve");
         let result = resolve_existing_path_within_root(
             &canonical_root,
@@ -155,9 +161,12 @@ mod tests {
         fs::create_dir_all(inside.parent().expect("parent should exist"))
             .await
             .expect("parent should be created");
-        fs::write(&inside, b"archive").await.expect("inside file should be created");
+        fs::write(&inside, b"archive")
+            .await
+            .expect("inside file should be created");
 
-        let canonical_root = ensure_builder_root_dir(root.to_str().expect("root path")).await
+        let canonical_root = ensure_builder_root_dir(root.to_str().expect("root path"))
+            .await
             .expect("root should resolve");
         let resolved = resolve_existing_path_within_root(
             &canonical_root,

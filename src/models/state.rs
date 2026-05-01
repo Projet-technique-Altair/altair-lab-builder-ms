@@ -26,10 +26,9 @@
  *
  * @packageDocumentation
  */
-
 use std::{collections::HashMap, sync::Arc};
 
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Semaphore};
 
 use crate::services::{builds::BuildsService, source_bundles::SourceBundlesService};
 
@@ -51,6 +50,13 @@ pub struct BuilderConfig {
     pub local_kind_cluster_name: String,
     pub local_kind_load_enabled: bool,
     pub local_mode: bool,
+    pub max_upload_files: usize,
+    pub max_upload_file_bytes: usize,
+    pub max_upload_total_bytes: usize,
+    pub max_text_field_bytes: usize,
+    pub max_archive_entries: usize,
+    pub max_archive_uncompressed_bytes: u64,
+    pub max_concurrent_builds: usize,
 }
 
 #[derive(Clone)]
@@ -87,10 +93,27 @@ impl State {
             ),
             local_kind_load_enabled: parse_bool_env("LAB_BUILDER_LOCAL_KIND_LOAD_ENABLED", true),
             local_mode: parse_bool_env("LAB_BUILDER_LOCAL_MODE", true),
+            max_upload_files: env_usize_or_default("LAB_BUILDER_MAX_UPLOAD_FILES", 200),
+            max_upload_file_bytes: env_usize_or_default(
+                "LAB_BUILDER_MAX_UPLOAD_FILE_BYTES",
+                10 * 1024 * 1024,
+            ),
+            max_upload_total_bytes: env_usize_or_default(
+                "LAB_BUILDER_MAX_UPLOAD_TOTAL_BYTES",
+                50 * 1024 * 1024,
+            ),
+            max_text_field_bytes: env_usize_or_default("LAB_BUILDER_MAX_TEXT_FIELD_BYTES", 4096),
+            max_archive_entries: env_usize_or_default("LAB_BUILDER_MAX_ARCHIVE_ENTRIES", 2000),
+            max_archive_uncompressed_bytes: env_u64_or_default(
+                "LAB_BUILDER_MAX_ARCHIVE_UNCOMPRESSED_BYTES",
+                250 * 1024 * 1024,
+            ),
+            max_concurrent_builds: env_usize_or_default("LAB_BUILDER_MAX_CONCURRENT_BUILDS", 2),
         };
 
         let jobs = Arc::new(RwLock::new(HashMap::new()));
-        let builds_service = BuildsService::new(config.clone(), jobs.clone());
+        let build_slots = Arc::new(Semaphore::new(config.max_concurrent_builds.max(1)));
+        let builds_service = BuildsService::new(config.clone(), jobs.clone(), build_slots);
         let source_bundles_service = SourceBundlesService::new(config);
 
         Self {
@@ -108,6 +131,14 @@ fn env_u64_or_default(key: &str, default: u64) -> u64 {
     std::env::var(key)
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
+}
+
+fn env_usize_or_default(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
         .unwrap_or(default)
 }
 

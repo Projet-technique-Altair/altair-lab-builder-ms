@@ -30,7 +30,6 @@
  *
  * @packageDocumentation
  */
-
 use axum::{
     extract::{Multipart, State},
     Json,
@@ -62,7 +61,7 @@ pub async fn create_source_bundle(
     State(state): State<AppState>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<SourceBundle>>, AppError> {
-    let payload = parse_source_bundle_payload(multipart).await?;
+    let payload = parse_source_bundle_payload(&state, multipart).await?;
     info!(
         lab_id = ?payload.lab_id,
         requested_by = ?payload.requested_by,
@@ -82,7 +81,7 @@ pub async fn create_build_from_upload(
     State(state): State<AppState>,
     multipart: Multipart,
 ) -> Result<Json<ApiResponse<BuildFromUploadResponse>>, AppError> {
-    let payload = parse_source_bundle_payload(multipart).await?;
+    let payload = parse_source_bundle_payload(&state, multipart).await?;
     info!(
         lab_id = ?payload.lab_id,
         lab_name = ?payload.lab_name,
@@ -173,6 +172,7 @@ pub async fn create_build_from_upload(
 }
 
 async fn parse_source_bundle_payload(
+    state: &AppState,
     mut multipart: Multipart,
 ) -> Result<SourceBundleMultipartPayload, AppError> {
     let mut lab_id = None;
@@ -182,6 +182,7 @@ async fn parse_source_bundle_payload(
     let mut image_tag = None;
     let mut dockerfile_path = None;
     let mut uploaded_files = Vec::new();
+    let mut total_upload_bytes = 0_usize;
 
     while let Some(field) = multipart
         .next_field()
@@ -192,24 +193,78 @@ async fn parse_source_bundle_payload(
         let file_name = field.file_name().map(ToString::to_string);
 
         match (field_name.as_str(), file_name) {
-            ("lab_id", None) => assign_text_field(&mut lab_id, field, "lab_id").await?,
-            ("lab_name", None) => assign_text_field(&mut lab_name, field, "lab_name").await?,
-            ("requested_by", None) => {
-                assign_text_field(&mut requested_by, field, "requested_by").await?
+            ("lab_id", None) => {
+                assign_text_field(
+                    &mut lab_id,
+                    field,
+                    "lab_id",
+                    state.source_bundles_service.max_text_field_bytes(),
+                )
+                .await?
             }
-            ("image_name", None) => assign_text_field(&mut image_name, field, "image_name").await?,
-            ("image_tag", None) => assign_text_field(&mut image_tag, field, "image_tag").await?,
+            ("lab_name", None) => {
+                assign_text_field(
+                    &mut lab_name,
+                    field,
+                    "lab_name",
+                    state.source_bundles_service.max_text_field_bytes(),
+                )
+                .await?
+            }
+            ("requested_by", None) => {
+                assign_text_field(
+                    &mut requested_by,
+                    field,
+                    "requested_by",
+                    state.source_bundles_service.max_text_field_bytes(),
+                )
+                .await?
+            }
+            ("image_name", None) => {
+                assign_text_field(
+                    &mut image_name,
+                    field,
+                    "image_name",
+                    state.source_bundles_service.max_text_field_bytes(),
+                )
+                .await?
+            }
+            ("image_tag", None) => {
+                assign_text_field(
+                    &mut image_tag,
+                    field,
+                    "image_tag",
+                    state.source_bundles_service.max_text_field_bytes(),
+                )
+                .await?
+            }
             ("dockerfile_path", None) => {
-                assign_text_field(&mut dockerfile_path, field, "dockerfile_path").await?
+                assign_text_field(
+                    &mut dockerfile_path,
+                    field,
+                    "dockerfile_path",
+                    state.source_bundles_service.max_text_field_bytes(),
+                )
+                .await?
             }
             (_, Some(file_name)) => {
-                let bytes = field.bytes().await.map_err(|error| {
-                    AppError::BadRequest(format!("Failed to read uploaded file bytes: {error}"))
-                })?;
+                if uploaded_files.len() >= state.source_bundles_service.max_upload_files() {
+                    return Err(AppError::BadRequest(
+                        "Upload contains too many files".into(),
+                    ));
+                }
+
+                let bytes = read_limited_field_bytes(
+                    field,
+                    state.source_bundles_service.max_upload_file_bytes(),
+                    state.source_bundles_service.max_upload_total_bytes(),
+                    &mut total_upload_bytes,
+                )
+                .await?;
 
                 uploaded_files.push(UploadedFileInput {
                     relative_path: file_name,
-                    bytes: bytes.to_vec(),
+                    bytes,
                 });
             }
             _ => {}
@@ -231,16 +286,67 @@ async fn assign_text_field(
     target: &mut Option<String>,
     field: axum::extract::multipart::Field<'_>,
     field_name: &str,
+    max_bytes: usize,
 ) -> Result<(), AppError> {
-    let value = field.text().await.map_err(|error| {
-        AppError::BadRequest(format!("Failed to read {field_name} field: {error}"))
-    })?;
+    let bytes = read_limited_text_field(field, field_name, max_bytes).await?;
+    let value = String::from_utf8(bytes)
+        .map_err(|_| AppError::BadRequest(format!("{field_name} must be valid UTF-8")))?;
 
     if !value.trim().is_empty() {
         *target = Some(value);
     }
 
     Ok(())
+}
+
+async fn read_limited_text_field(
+    mut field: axum::extract::multipart::Field<'_>,
+    field_name: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, AppError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("Failed to read {field_name}: {error}")))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > max_bytes {
+            return Err(AppError::BadRequest(format!("{field_name} is too large")));
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+async fn read_limited_field_bytes(
+    mut field: axum::extract::multipart::Field<'_>,
+    max_file_bytes: usize,
+    max_total_bytes: usize,
+    total_upload_bytes: &mut usize,
+) -> Result<Vec<u8>, AppError> {
+    let mut bytes = Vec::new();
+    while let Some(chunk) = field
+        .chunk()
+        .await
+        .map_err(|error| AppError::BadRequest(format!("Failed to read uploaded file bytes: {error}")))?
+    {
+        if bytes.len().saturating_add(chunk.len()) > max_file_bytes {
+            return Err(AppError::BadRequest(
+                "Uploaded file exceeds the configured size limit".into(),
+            ));
+        }
+
+        if (*total_upload_bytes).saturating_add(chunk.len()) > max_total_bytes {
+            return Err(AppError::BadRequest(
+                "Upload exceeds the configured total size limit".into(),
+            ));
+        }
+
+        *total_upload_bytes = (*total_upload_bytes).saturating_add(chunk.len());
+        bytes.extend_from_slice(&chunk);
+    }
+
+    Ok(bytes)
 }
 
 fn normalize_image_name(value: &str) -> String {
