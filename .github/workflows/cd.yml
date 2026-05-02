@@ -6,6 +6,11 @@ on:
     types: [completed]
     branches: [main]
   workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Tag de l'image a redeployer manuellement (sha ou vN)"
+        required: true
+        type: string
 
 permissions:
   contents: read
@@ -25,10 +30,7 @@ jobs:
 
       service_name: altair-lab-builder-ms
       image_name: altair-lab-builder-ms
-
-      workdir: .
-      dockerfile: Dockerfile
-      platform: linux/amd64
+      image_tag: ${{ github.event_name == 'workflow_dispatch' && inputs.image_tag || '' }}
 
       cloud_run_service_account: ${{ vars.CLOUD_RUN_SERVICE_ACCOUNT }}
       cloud_run_env_vars: ${{ vars.CLOUD_RUN_ENV_VARS }}

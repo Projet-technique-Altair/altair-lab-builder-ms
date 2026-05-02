@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
   security-events: write
 
 jobs:
@@ -15,3 +16,9 @@ jobs:
     uses: Projet-technique-Altair/altair-ci/.github/workflows/rust-ms.yml@main
     with:
       rust_toolchain: stable
+      gcp_project_id: ${{ vars.GCP_PROJECT_ID }}
+      artifact_registry_host: ${{ vars.GCP_ARTIFACT_REGISTRY_HOST }}
+      artifact_registry_repo: ${{ vars.GCP_ARTIFACT_REPO }}
+      image_name: altair-lab-builder-ms
+      workload_identity_provider: ${{ vars.GCP_WIF_PROVIDER }}
+      push_service_account: ${{ vars.GCP_SERVICE_ACCOUNT }}
