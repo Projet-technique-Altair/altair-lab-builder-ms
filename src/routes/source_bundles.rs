@@ -325,11 +325,9 @@ async fn read_limited_field_bytes(
     total_upload_bytes: &mut usize,
 ) -> Result<Vec<u8>, AppError> {
     let mut bytes = Vec::new();
-    while let Some(chunk) = field
-        .chunk()
-        .await
-        .map_err(|error| AppError::BadRequest(format!("Failed to read uploaded file bytes: {error}")))?
-    {
+    while let Some(chunk) = field.chunk().await.map_err(|error| {
+        AppError::BadRequest(format!("Failed to read uploaded file bytes: {error}"))
+    })? {
         if bytes.len().saturating_add(chunk.len()) > max_file_bytes {
             return Err(AppError::BadRequest(
                 "Uploaded file exceeds the configured size limit".into(),

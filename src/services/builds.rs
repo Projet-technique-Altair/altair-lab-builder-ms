@@ -424,7 +424,9 @@ impl BuildsService {
                 AppError::Internal(format!("Failed to read local source archive: {error}"))
             })? {
                 let mut entry = entry.map_err(|error| {
-                    AppError::Internal(format!("Failed to read local source archive entry: {error}"))
+                    AppError::Internal(format!(
+                        "Failed to read local source archive entry: {error}"
+                    ))
                 })?;
 
                 entry_count = entry_count.saturating_add(1);
@@ -450,7 +452,9 @@ impl BuildsService {
                 }
 
                 let path = entry.path().map_err(|error| {
-                    AppError::BadRequest(format!("Source archive entry has an invalid path: {error}"))
+                    AppError::BadRequest(format!(
+                        "Source archive entry has an invalid path: {error}"
+                    ))
                 })?;
                 let destination_path = join_relative_to_root(&destination_clone, path.as_ref())?;
                 drop(path);
@@ -462,11 +466,15 @@ impl BuildsService {
                 } else {
                     if let Some(parent) = destination_path.parent() {
                         std::fs::create_dir_all(parent).map_err(|error| {
-                            AppError::Internal(format!("Failed to create archive parent directory: {error}"))
+                            AppError::Internal(format!(
+                                "Failed to create archive parent directory: {error}"
+                            ))
                         })?;
                     }
                     entry.unpack(&destination_path).map_err(|error| {
-                        AppError::Internal(format!("Failed to extract local source archive entry: {error}"))
+                        AppError::Internal(format!(
+                            "Failed to extract local source archive entry: {error}"
+                        ))
                     })?;
                 }
             }
@@ -1323,7 +1331,7 @@ mod tests {
         time::{SystemTime, UNIX_EPOCH},
     };
 
-    use tokio::sync::RwLock;
+    use tokio::sync::{RwLock, Semaphore};
     use tokio::time::{sleep, Duration, Instant};
 
     use crate::models::{
@@ -1392,7 +1400,19 @@ mod tests {
             local_kind_cluster_name: "kind".into(),
             local_kind_load_enabled: true,
             local_mode: true,
+            max_upload_files: 200,
+            max_upload_file_bytes: 10 * 1024 * 1024,
+            max_upload_total_bytes: 50 * 1024 * 1024,
+            max_text_field_bytes: 4096,
+            max_archive_entries: 2000,
+            max_archive_uncompressed_bytes: 250 * 1024 * 1024,
+            max_concurrent_builds: 2,
         }
+    }
+
+    fn test_service(config: BuilderConfig) -> BuildsService {
+        let build_slots = Arc::new(Semaphore::new(config.max_concurrent_builds.max(1)));
+        BuildsService::new(config, Arc::new(RwLock::new(HashMap::new())), build_slots)
     }
 
     #[tokio::test]
@@ -1409,7 +1429,7 @@ mod tests {
         let archive_path = archive_root.join("lab-builder-build.tar.gz");
         std::fs::write(&archive_path, b"fake tar gz payload").expect("archive should be written");
 
-        let service = BuildsService::new(config.clone(), Arc::new(RwLock::new(HashMap::new())));
+        let service = test_service(config.clone());
 
         let job = service
             .create_build(CreateBuildRequest {
@@ -1442,7 +1462,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_build_rejects_gcs_source_in_local_mode() {
-        let service = BuildsService::new(test_config(), Arc::new(RwLock::new(HashMap::new())));
+        let service = test_service(test_config());
 
         let result = service
             .create_build(CreateBuildRequest {
@@ -1475,7 +1495,7 @@ mod tests {
 
         let mut config = config;
         config.local_mode = false;
-        let service = BuildsService::new(config, Arc::new(RwLock::new(HashMap::new())));
+        let service = test_service(config);
 
         let result = service
             .create_build(CreateBuildRequest {
@@ -1503,7 +1523,7 @@ mod tests {
         std::fs::write(&outside_archive, b"fake tar gz payload")
             .expect("archive should be written");
 
-        let service = BuildsService::new(config, Arc::new(RwLock::new(HashMap::new())));
+        let service = test_service(config);
 
         let result = service
             .create_build(CreateBuildRequest {

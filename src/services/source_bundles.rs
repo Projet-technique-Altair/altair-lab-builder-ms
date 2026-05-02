@@ -368,6 +368,13 @@ mod tests {
             local_kind_cluster_name: "kind".into(),
             local_kind_load_enabled: true,
             local_mode: true,
+            max_upload_files: 200,
+            max_upload_file_bytes: 10 * 1024 * 1024,
+            max_upload_total_bytes: 50 * 1024 * 1024,
+            max_text_field_bytes: 4096,
+            max_archive_entries: 2000,
+            max_archive_uncompressed_bytes: 250 * 1024 * 1024,
+            max_concurrent_builds: 2,
         }
     }
 
