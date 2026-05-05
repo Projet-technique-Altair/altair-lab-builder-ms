@@ -43,6 +43,7 @@ pub struct SourceBundle {
     pub archive_path: String,
     pub suggested_gcs_path: String,
     pub archive_size_bytes: u64,
+    pub source_context_hash: String,
     pub file_count: usize,
     pub files: Vec<UploadedFile>,
     pub created_at: DateTime<Utc>,

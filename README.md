@@ -112,7 +112,14 @@ This is the cleanest endpoint for the creator flow.
 
 ## Current Platform Flow
 
-The builder does not persist `template_path` by itself.
+In cloud mode, the builder can reuse a previous ready image when the uploaded
+build context has the same `source_context_hash`, `dockerfile_path`, and
+`image_tag`. Reuse is first checked in memory, then optionally in the Labs
+database when `LAB_BUILD_ARTIFACTS_DATABASE_URL`, `LABS_MS_DATABASE_URL`, or
+`LABS_DATABASE_URL` is configured.
+
+The persistent cache stores image build artifacts only. The canonical lab
+metadata and active `template_path` still belong to `labs-ms`.
 
 The current flow is:
 
@@ -217,7 +224,8 @@ Image name resolution priority:
 Returns the current in-memory representation of a previously created build job.
 
 Build jobs are stored only in process memory. If the service restarts, previous
-jobs are no longer available from this endpoint.
+jobs are no longer available from this endpoint. Ready build artifacts may still
+be reused through the optional persistent cache.
 
 ## Build Job Model
 
@@ -233,6 +241,7 @@ Returned build jobs include:
 - `template_path`
 - `source_archive_path`
 - `dockerfile_path`
+- `source_context_hash`
 - `gcp_region`
 - `build_source_bucket`
 - `local_kind_cluster_name`
@@ -277,6 +286,8 @@ The service reads its configuration from environment variables.
 - `ARTIFACT_REGISTRY_HOST`
 - `ARTIFACT_REGISTRY_REPO`
 - `LAB_BUILD_SOURCE_BUCKET`
+- `LAB_BUILD_ARTIFACTS_DATABASE_URL`
+- `LABS_MS_DATABASE_URL` / `LABS_DATABASE_URL` (fallbacks for the same cache)
 - `CLOUD_BUILD_TIMEOUT_SECONDS`
 - `CLOUD_BUILD_SERVICE_ACCOUNT`
 - `CLOUD_BUILD_LOGS_BUCKET`

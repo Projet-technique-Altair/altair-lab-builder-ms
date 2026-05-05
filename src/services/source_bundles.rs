@@ -32,6 +32,7 @@
  * @packageDocumentation
  */
 use std::{
+    collections::BTreeMap,
     path::{Component, Path, PathBuf},
     sync::Arc,
 };
@@ -39,6 +40,7 @@ use std::{
 use chrono::Utc;
 use flate2::{write::GzEncoder, Compression};
 use reqwest::Client;
+use ring::digest::{Context, SHA256};
 use tar::Builder;
 use tokio::fs;
 use tracing::info;
@@ -123,10 +125,12 @@ impl SourceBundlesService {
         })?;
 
         let mut stored_files = Vec::with_capacity(files.len());
+        let mut context_files = BTreeMap::new();
 
         for file in files {
             let sanitized_path = sanitize_relative_path(&file.relative_path)?;
             let destination = join_relative_to_root(&workspace_dir, &sanitized_path)?;
+            let path_for_hash = sanitized_path.display().to_string();
 
             if let Some(parent) = destination.parent() {
                 fs::create_dir_all(parent).await.map_err(|error| {
@@ -140,8 +144,9 @@ impl SourceBundlesService {
                     AppError::Internal(format!("Failed to persist uploaded file: {error}"))
                 })?;
 
+            context_files.insert(path_for_hash.clone(), file.bytes.clone());
             stored_files.push(UploadedFile {
-                path: sanitized_path.display().to_string(),
+                path: path_for_hash,
                 size_bytes: file.bytes.len() as u64,
             });
         }
@@ -153,6 +158,7 @@ impl SourceBundlesService {
         );
 
         create_tar_gz_archive(workspace_dir.clone(), archive_path.clone()).await?;
+        let source_context_hash = compute_source_context_hash(&context_files);
 
         let archive_metadata = fs::metadata(&archive_path)
             .await
@@ -183,6 +189,7 @@ impl SourceBundlesService {
             archive_path: archive_path.display().to_string(),
             suggested_gcs_path,
             archive_size_bytes: archive_metadata.len(),
+            source_context_hash,
             file_count: stored_files.len(),
             files: stored_files,
             created_at: Utc::now(),
@@ -240,6 +247,24 @@ impl SourceBundlesService {
 
         Ok(bundle.suggested_gcs_path.clone())
     }
+}
+
+fn compute_source_context_hash(files: &BTreeMap<String, Vec<u8>>) -> String {
+    let mut context = Context::new(&SHA256);
+    context.update(b"altair-source-context-v1\0");
+
+    for (path, content) in files {
+        context.update(&(path.len() as u64).to_be_bytes());
+        context.update(path.as_bytes());
+        context.update(&(content.len() as u64).to_be_bytes());
+        context.update(content);
+    }
+
+    let hash = context.finish();
+    hash.as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 async fn create_tar_gz_archive(
@@ -348,7 +373,10 @@ mod tests {
 
     use crate::models::state::BuilderConfig;
 
-    use super::{sanitize_relative_path, SourceBundlesService, UploadedFileInput};
+    use super::{
+        compute_source_context_hash, sanitize_relative_path, SourceBundlesService,
+        UploadedFileInput,
+    };
 
     fn test_config(bundle_root_dir: String) -> BuilderConfig {
         BuilderConfig {
@@ -358,6 +386,7 @@ mod tests {
             artifact_registry_repo: "altair-labs".into(),
             build_source_bucket: "altair-lab-builds".into(),
             bundle_root_dir,
+            lab_build_artifacts_database_url: None,
             cloud_build_timeout_seconds: 1200,
             cloud_build_poll_interval_seconds: 1,
             cloud_build_service_account: None,
@@ -376,6 +405,34 @@ mod tests {
             max_archive_uncompressed_bytes: 250 * 1024 * 1024,
             max_concurrent_builds: 2,
         }
+    }
+
+    #[test]
+    fn source_context_hash_is_stable_for_same_files() {
+        let mut first = std::collections::BTreeMap::new();
+        first.insert(
+            "Dockerfile".to_string(),
+            b"FROM debian:bookworm-slim\n".to_vec(),
+        );
+        first.insert(
+            "app/start.sh".to_string(),
+            b"#!/bin/sh\necho hello\n".to_vec(),
+        );
+
+        let mut second = std::collections::BTreeMap::new();
+        second.insert(
+            "app/start.sh".to_string(),
+            b"#!/bin/sh\necho hello\n".to_vec(),
+        );
+        second.insert(
+            "Dockerfile".to_string(),
+            b"FROM debian:bookworm-slim\n".to_vec(),
+        );
+
+        assert_eq!(
+            compute_source_context_hash(&first),
+            compute_source_context_hash(&second)
+        );
     }
 
     #[test]
@@ -426,6 +483,7 @@ mod tests {
                 bundle.bundle_id
             )
         );
+        assert!(!bundle.source_context_hash.is_empty());
 
         let _ = std::fs::remove_dir_all(bundle_root);
     }

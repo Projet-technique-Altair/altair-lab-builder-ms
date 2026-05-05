@@ -53,6 +53,8 @@ pub struct CreateBuildRequest {
     #[serde(alias = "source_archive_gcs_path")]
     pub source_archive_path: String,
     pub dockerfile_path: Option<String>,
+    #[serde(default, skip_deserializing)]
+    pub source_context_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +70,7 @@ pub struct BuildJob {
     pub template_path: String,
     pub source_archive_path: String,
     pub dockerfile_path: String,
+    pub source_context_hash: Option<String>,
     pub gcp_region: String,
     pub build_source_bucket: String,
     pub local_kind_cluster_name: Option<String>,

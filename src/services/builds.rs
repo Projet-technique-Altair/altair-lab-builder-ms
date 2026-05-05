@@ -15,8 +15,8 @@
  * Key features:
  *
  *  - Dual execution mode:
- *      • Local (Docker + Kind cluster)
- *      • Cloud (GCP Cloud Build)
+ *    - Local (Docker + Kind cluster)
+ *    - Cloud (GCP Cloud Build)
  *  - Secure handling of source archives (path validation, sandboxing)
  *  - Full lifecycle tracking (queued → submitted → ready/failed)
  *  - Background processing using async tasks
@@ -45,6 +45,7 @@ use flate2::read::GzDecoder;
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sqlx::{postgres::PgPoolOptions, FromRow, PgPool};
 use tar::Archive;
 use tokio::{
     fs,
@@ -72,8 +73,24 @@ const CLOUD_BUILD_API_BASE_URL: &str = "https://cloudbuild.googleapis.com/";
 pub struct BuildsService {
     config: BuilderConfig,
     jobs: Arc<RwLock<HashMap<Uuid, BuildJob>>>,
+    ready_builds_by_context: Arc<RwLock<HashMap<BuildCacheKey, BuildJob>>>,
+    build_artifacts_db: Option<PgPool>,
     http_client: Client,
     build_slots: Arc<Semaphore>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct BuildCacheKey {
+    image_tag: String,
+    dockerfile_path: String,
+    source_context_hash: String,
+}
+
+struct ReuseBuildInput {
+    lab_id: Option<String>,
+    requested_by: Option<String>,
+    dockerfile_path: String,
+    source_context_hash: Option<String>,
 }
 
 impl BuildsService {
@@ -82,9 +99,34 @@ impl BuildsService {
         jobs: Arc<RwLock<HashMap<Uuid, BuildJob>>>,
         build_slots: Arc<Semaphore>,
     ) -> Self {
+        let build_artifacts_db = if config.local_mode {
+            None
+        } else {
+            config
+                .lab_build_artifacts_database_url
+                .as_deref()
+                .and_then(|database_url| {
+                    match PgPoolOptions::new()
+                        .max_connections(3)
+                        .connect_lazy(database_url)
+                    {
+                        Ok(pool) => Some(pool),
+                        Err(error) => {
+                            tracing::warn!(
+                                error = %error,
+                                "Persistent lab build artifact cache disabled"
+                            );
+                            None
+                        }
+                    }
+                })
+        };
+
         Self {
             config,
             jobs,
+            ready_builds_by_context: Arc::new(RwLock::new(HashMap::new())),
+            build_artifacts_db,
             http_client: Client::new(),
             build_slots,
         }
@@ -92,6 +134,61 @@ impl BuildsService {
 
     pub fn is_local_mode(&self) -> bool {
         self.config.local_mode
+    }
+
+    pub async fn reuse_ready_build_if_context_matches(
+        &self,
+        lab_id: Option<String>,
+        requested_by: Option<String>,
+        image_name: String,
+        image_tag: Option<String>,
+        dockerfile_path: Option<String>,
+        source_context_hash: String,
+    ) -> Result<Option<BuildJob>, AppError> {
+        validate_image_name(&image_name)?;
+        let image_tag = normalized_image_tag(image_tag.as_deref());
+        let dockerfile_path = normalized_dockerfile_path(dockerfile_path.as_deref());
+        let Some(cache_key) =
+            build_cache_key(&image_tag, &dockerfile_path, Some(&source_context_hash))
+        else {
+            return Ok(None);
+        };
+
+        if let Some(previous_job) = self
+            .ready_builds_by_context
+            .read()
+            .await
+            .get(&cache_key)
+            .cloned()
+        {
+            let job = self.reused_job_from_previous(
+                previous_job,
+                ReuseBuildInput {
+                    lab_id,
+                    requested_by,
+                    dockerfile_path,
+                    source_context_hash: Some(source_context_hash),
+                },
+            );
+            self.store_job(job.clone()).await;
+            return Ok(Some(job));
+        }
+
+        let job = self
+            .find_persisted_reusable_ready_build(
+                lab_id,
+                requested_by,
+                &image_tag,
+                &dockerfile_path,
+                &source_context_hash,
+            )
+            .await;
+
+        if let Some(job) = &job {
+            self.store_job(job.clone()).await;
+        }
+
+        Ok(job)
     }
 
     pub async fn create_build(&self, payload: CreateBuildRequest) -> Result<BuildJob, AppError> {
@@ -102,6 +199,7 @@ impl BuildsService {
             image_tag = ?payload.image_tag,
             source_archive_path = %payload.source_archive_path,
             dockerfile_path = ?payload.dockerfile_path,
+            source_context_hash = ?payload.source_context_hash,
             local_mode = self.config.local_mode,
             "Creating build job"
         );
@@ -110,20 +208,14 @@ impl BuildsService {
         validate_image_name(&payload.image_name)?;
 
         let build_id = Uuid::new_v4();
-        let image_tag = payload
-            .image_tag
+        let image_tag = normalized_image_tag(payload.image_tag.as_deref());
+        let dockerfile_path = normalized_dockerfile_path(payload.dockerfile_path.as_deref());
+        let source_context_hash = payload
+            .source_context_hash
             .as_deref()
             .map(str::trim)
             .filter(|value| !value.is_empty())
-            .unwrap_or("v1")
-            .to_string();
-        let dockerfile_path = payload
-            .dockerfile_path
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .unwrap_or("Dockerfile")
-            .to_string();
+            .map(ToString::to_string);
 
         let image_base = format!(
             "{}/{}/{}/{}",
@@ -160,6 +252,7 @@ impl BuildsService {
             template_path,
             source_archive_path: payload.source_archive_path,
             dockerfile_path,
+            source_context_hash,
             gcp_region: self.config.gcp_region.clone(),
             build_source_bucket: self.config.build_source_bucket.clone(),
             local_kind_cluster_name: if self.config.local_mode
@@ -178,6 +271,37 @@ impl BuildsService {
             latest_image_uri,
             created_at: Utc::now(),
         };
+
+        if let Some(previous_job) = self.find_reusable_ready_build(&job).await {
+            let job = self.reused_job_from_previous(
+                previous_job,
+                ReuseBuildInput {
+                    lab_id: job.lab_id,
+                    requested_by: job.requested_by,
+                    dockerfile_path: job.dockerfile_path,
+                    source_context_hash: job.source_context_hash,
+                },
+            );
+            self.store_job(job.clone()).await;
+            info!(
+                build_id = %job.build_id,
+                template_path = %job.template_path,
+                source_context_hash = ?job.source_context_hash,
+                "Build context unchanged; reusing existing image"
+            );
+            return Ok(job);
+        }
+
+        if let Some(job) = self.find_persisted_reusable_ready_build_for_job(&job).await {
+            self.store_job(job.clone()).await;
+            info!(
+                build_id = %job.build_id,
+                template_path = %job.template_path,
+                source_context_hash = ?job.source_context_hash,
+                "Build context unchanged; reusing persisted image"
+            );
+            return Ok(job);
+        }
 
         if self.config.local_mode {
             let permit = self.acquire_build_slot()?;
@@ -220,7 +344,224 @@ impl BuildsService {
     }
 
     async fn store_job(&self, job: BuildJob) {
-        self.jobs.write().await.insert(job.build_id, job);
+        self.jobs.write().await.insert(job.build_id, job.clone());
+
+        if job.status == BuildStatus::Ready {
+            if let Some(cache_key) = build_cache_key(
+                &job.image_tag,
+                &job.dockerfile_path,
+                job.source_context_hash.as_deref(),
+            ) {
+                self.ready_builds_by_context
+                    .write()
+                    .await
+                    .insert(cache_key, job.clone());
+            }
+
+            self.persist_ready_build_artifact(&job).await;
+        }
+    }
+
+    async fn find_reusable_ready_build(&self, job: &BuildJob) -> Option<BuildJob> {
+        let cache_key = build_cache_key(
+            &job.image_tag,
+            &job.dockerfile_path,
+            job.source_context_hash.as_deref(),
+        )?;
+
+        self.ready_builds_by_context
+            .read()
+            .await
+            .get(&cache_key)
+            .cloned()
+    }
+
+    fn reused_job_from_previous(&self, previous_job: BuildJob, input: ReuseBuildInput) -> BuildJob {
+        BuildJob {
+            build_id: Uuid::new_v4(),
+            lab_id: input.lab_id,
+            requested_by: input.requested_by,
+            status: BuildStatus::Ready,
+            failure_message: None,
+            dispatch_mode: if self.config.local_mode {
+                BuildDispatchMode::LocalDockerKind
+            } else {
+                BuildDispatchMode::CloudBuild
+            },
+            image_name: previous_job.image_name,
+            image_tag: previous_job.image_tag,
+            template_path: previous_job.template_path,
+            source_archive_path: previous_job.source_archive_path,
+            dockerfile_path: input.dockerfile_path,
+            source_context_hash: input.source_context_hash,
+            gcp_region: self.config.gcp_region.clone(),
+            build_source_bucket: self.config.build_source_bucket.clone(),
+            local_kind_cluster_name: previous_job.local_kind_cluster_name,
+            loaded_to_kind: previous_job.loaded_to_kind,
+            cloud_build_id: previous_job.cloud_build_id,
+            cloud_build_name: previous_job.cloud_build_name,
+            cloud_build_operation_name: previous_job.cloud_build_operation_name,
+            cloud_build_log_url: previous_job.cloud_build_log_url,
+            versioned_image_uri: previous_job.versioned_image_uri,
+            latest_image_uri: previous_job.latest_image_uri,
+            created_at: Utc::now(),
+        }
+    }
+
+    async fn find_persisted_reusable_ready_build_for_job(
+        &self,
+        job: &BuildJob,
+    ) -> Option<BuildJob> {
+        self.find_persisted_reusable_ready_build(
+            job.lab_id.clone(),
+            job.requested_by.clone(),
+            &job.image_tag,
+            &job.dockerfile_path,
+            job.source_context_hash.as_deref()?,
+        )
+        .await
+    }
+
+    async fn find_persisted_reusable_ready_build(
+        &self,
+        lab_id: Option<String>,
+        requested_by: Option<String>,
+        image_tag: &str,
+        dockerfile_path: &str,
+        source_context_hash: &str,
+    ) -> Option<BuildJob> {
+        let Some(db) = &self.build_artifacts_db else {
+            return None;
+        };
+
+        let row = sqlx::query_as::<_, PersistedBuildArtifactRow>(
+            r#"
+            SELECT
+                image_name,
+                image_tag,
+                template_path,
+                source_archive_path,
+                dockerfile_path,
+                source_context_hash,
+                dispatch_mode,
+                loaded_to_kind,
+                cloud_build_id,
+                cloud_build_name,
+                cloud_build_operation_name,
+                cloud_build_log_url,
+                versioned_image_uri,
+                latest_image_uri
+            FROM lab_build_artifacts
+            WHERE source_context_hash = $1
+              AND dockerfile_path = $2
+              AND image_tag = $3
+              AND status = 'READY'
+            LIMIT 1
+            "#,
+        )
+        .bind(source_context_hash)
+        .bind(dockerfile_path)
+        .bind(image_tag)
+        .fetch_optional(db)
+        .await;
+
+        match row {
+            Ok(Some(row)) => Some(row.into_build_job(
+                lab_id,
+                requested_by,
+                self.config.gcp_region.clone(),
+                self.config.build_source_bucket.clone(),
+            )),
+            Ok(None) => None,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "Persistent lab build artifact lookup failed; falling back to build"
+                );
+                None
+            }
+        }
+    }
+
+    async fn persist_ready_build_artifact(&self, job: &BuildJob) {
+        if self.config.local_mode {
+            return;
+        }
+
+        let Some(db) = &self.build_artifacts_db else {
+            return;
+        };
+
+        let Some(source_context_hash) = job.source_context_hash.as_deref() else {
+            return;
+        };
+
+        let result = sqlx::query(
+            r#"
+            INSERT INTO lab_build_artifacts (
+                source_context_hash,
+                dockerfile_path,
+                image_tag,
+                image_name,
+                template_path,
+                source_archive_path,
+                versioned_image_uri,
+                latest_image_uri,
+                dispatch_mode,
+                loaded_to_kind,
+                cloud_build_id,
+                cloud_build_name,
+                cloud_build_operation_name,
+                cloud_build_log_url,
+                status,
+                last_used_at
+            )
+            VALUES (
+                $1, $2, $3, $4, $5, $6, $7, $8,
+                $9, $10, $11, $12, $13, $14, 'READY', timezone('UTC'::text, now())
+            )
+            ON CONFLICT (source_context_hash, dockerfile_path, image_tag)
+            DO UPDATE SET
+                image_name = EXCLUDED.image_name,
+                template_path = EXCLUDED.template_path,
+                source_archive_path = EXCLUDED.source_archive_path,
+                versioned_image_uri = EXCLUDED.versioned_image_uri,
+                latest_image_uri = EXCLUDED.latest_image_uri,
+                dispatch_mode = EXCLUDED.dispatch_mode,
+                loaded_to_kind = EXCLUDED.loaded_to_kind,
+                cloud_build_id = EXCLUDED.cloud_build_id,
+                cloud_build_name = EXCLUDED.cloud_build_name,
+                cloud_build_operation_name = EXCLUDED.cloud_build_operation_name,
+                cloud_build_log_url = EXCLUDED.cloud_build_log_url,
+                status = 'READY',
+                last_used_at = timezone('UTC'::text, now()),
+                updated_at = timezone('UTC'::text, now())
+            "#,
+        )
+        .bind(source_context_hash)
+        .bind(&job.dockerfile_path)
+        .bind(&job.image_tag)
+        .bind(&job.image_name)
+        .bind(&job.template_path)
+        .bind(&job.source_archive_path)
+        .bind(&job.versioned_image_uri)
+        .bind(&job.latest_image_uri)
+        .bind(format!("{:?}", job.dispatch_mode))
+        .bind(job.loaded_to_kind)
+        .bind(&job.cloud_build_id)
+        .bind(&job.cloud_build_name)
+        .bind(&job.cloud_build_operation_name)
+        .bind(&job.cloud_build_log_url)
+        .execute(db)
+        .await;
+
+        if let Err(error) = result {
+            tracing::warn!(
+                build_id = %job.build_id,
+                error = %error,
+                "Failed to persist ready lab build artifact"
+            );
+        }
     }
 
     fn acquire_build_slot(&self) -> Result<OwnedSemaphorePermit, AppError> {
@@ -962,6 +1303,60 @@ struct CloudBuildPollState {
     error_message: Option<String>,
 }
 
+#[derive(Debug, FromRow)]
+struct PersistedBuildArtifactRow {
+    image_name: String,
+    image_tag: String,
+    template_path: String,
+    source_archive_path: String,
+    dockerfile_path: String,
+    source_context_hash: String,
+    dispatch_mode: String,
+    loaded_to_kind: bool,
+    cloud_build_id: Option<String>,
+    cloud_build_name: Option<String>,
+    cloud_build_operation_name: Option<String>,
+    cloud_build_log_url: Option<String>,
+    versioned_image_uri: String,
+    latest_image_uri: String,
+}
+
+impl PersistedBuildArtifactRow {
+    fn into_build_job(
+        self,
+        lab_id: Option<String>,
+        requested_by: Option<String>,
+        gcp_region: String,
+        build_source_bucket: String,
+    ) -> BuildJob {
+        BuildJob {
+            build_id: Uuid::new_v4(),
+            lab_id,
+            requested_by,
+            status: BuildStatus::Ready,
+            failure_message: None,
+            dispatch_mode: parse_dispatch_mode(&self.dispatch_mode),
+            image_name: self.image_name,
+            image_tag: self.image_tag,
+            template_path: self.template_path,
+            source_archive_path: self.source_archive_path,
+            dockerfile_path: self.dockerfile_path,
+            source_context_hash: Some(self.source_context_hash),
+            gcp_region,
+            build_source_bucket,
+            local_kind_cluster_name: None,
+            loaded_to_kind: self.loaded_to_kind,
+            cloud_build_id: self.cloud_build_id,
+            cloud_build_name: self.cloud_build_name,
+            cloud_build_operation_name: self.cloud_build_operation_name,
+            cloud_build_log_url: self.cloud_build_log_url,
+            versioned_image_uri: self.versioned_image_uri,
+            latest_image_uri: self.latest_image_uri,
+            created_at: Utc::now(),
+        }
+    }
+}
+
 impl CloudBuildSnapshot {
     fn from_value(value: &Value) -> Option<Self> {
         let mut candidates = vec![value];
@@ -1229,6 +1624,45 @@ fn app_error_message(error: &AppError) -> String {
     }
 }
 
+fn normalized_image_tag(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("v1")
+        .to_string()
+}
+
+fn normalized_dockerfile_path(value: Option<&str>) -> String {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("Dockerfile")
+        .to_string()
+}
+
+fn build_cache_key(
+    image_tag: &str,
+    dockerfile_path: &str,
+    source_context_hash: Option<&str>,
+) -> Option<BuildCacheKey> {
+    let source_context_hash = source_context_hash
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+
+    Some(BuildCacheKey {
+        image_tag: image_tag.to_string(),
+        dockerfile_path: dockerfile_path.to_string(),
+        source_context_hash: source_context_hash.to_string(),
+    })
+}
+
+fn parse_dispatch_mode(value: &str) -> BuildDispatchMode {
+    match value {
+        "LocalDockerKind" | "LOCAL_DOCKER_KIND" => BuildDispatchMode::LocalDockerKind,
+        _ => BuildDispatchMode::CloudBuild,
+    }
+}
+
 fn validate_image_name(value: &str) -> Result<(), AppError> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
@@ -1390,6 +1824,7 @@ mod tests {
             artifact_registry_repo: "altair-labs".into(),
             build_source_bucket: "altair-lab-builds".into(),
             bundle_root_dir,
+            lab_build_artifacts_database_url: None,
             cloud_build_timeout_seconds: 1200,
             cloud_build_poll_interval_seconds: 1,
             cloud_build_service_account: None,
@@ -1439,6 +1874,7 @@ mod tests {
                 image_tag: None,
                 source_archive_path: archive_path.display().to_string(),
                 dockerfile_path: Some("Dockerfile".into()),
+                source_context_hash: Some("context-hash-local".into()),
             })
             .await
             .expect("local archive should be accepted");
@@ -1451,6 +1887,7 @@ mod tests {
             "europe-west9-docker.pkg.dev/altair-isen/altair-labs/lab-local:v1"
         );
         assert_eq!(job.source_archive_path, archive_path.display().to_string());
+        assert_eq!(job.source_context_hash, Some("context-hash-local".into()));
         assert!(!job.loaded_to_kind);
 
         let completed_job = wait_for_build_status(&service, job.build_id, BuildStatus::Ready).await;
@@ -1472,6 +1909,7 @@ mod tests {
                 image_tag: None,
                 source_archive_path: "gs://bucket/lab/source.tar.gz".into(),
                 dockerfile_path: None,
+                source_context_hash: None,
             })
             .await;
 
@@ -1505,6 +1943,7 @@ mod tests {
                 image_tag: None,
                 source_archive_path: archive_path.display().to_string(),
                 dockerfile_path: None,
+                source_context_hash: None,
             })
             .await;
 
@@ -1533,12 +1972,78 @@ mod tests {
                 image_tag: None,
                 source_archive_path: outside_archive.display().to_string(),
                 dockerfile_path: Some("Dockerfile".into()),
+                source_context_hash: None,
             })
             .await;
 
         assert!(result.is_err());
 
         let _ = std::fs::remove_file(outside_archive);
+    }
+
+    #[tokio::test]
+    async fn create_build_reuses_ready_image_when_context_hash_matches() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be valid")
+            .as_nanos();
+        let config = test_config();
+        let archive_root = Path::new(&config.bundle_root_dir)
+            .join("artifacts")
+            .join(unique.to_string());
+        std::fs::create_dir_all(&archive_root).expect("archive root should be created");
+        let first_archive_path = archive_root.join("first.tar.gz");
+        let second_archive_path = archive_root.join("second.tar.gz");
+        std::fs::write(&first_archive_path, b"fake tar gz payload")
+            .expect("first archive should be written");
+        std::fs::write(&second_archive_path, b"different fake tar gz payload")
+            .expect("second archive should be written");
+
+        let service = test_service(config.clone());
+
+        let first_job = service
+            .create_build(CreateBuildRequest {
+                lab_id: Some("lab-local".into()),
+                requested_by: Some("creator-local".into()),
+                image_name: "lab-local".into(),
+                image_tag: None,
+                source_archive_path: first_archive_path.display().to_string(),
+                dockerfile_path: Some("Dockerfile".into()),
+                source_context_hash: Some("same-context-hash".into()),
+            })
+            .await
+            .expect("first local archive should be accepted");
+
+        let ready_job =
+            wait_for_build_status(&service, first_job.build_id, BuildStatus::Ready).await;
+
+        let reused_job = service
+            .create_build(CreateBuildRequest {
+                lab_id: Some("lab-local".into()),
+                requested_by: Some("creator-local".into()),
+                image_name: "renamed-lab-title".into(),
+                image_tag: None,
+                source_archive_path: second_archive_path.display().to_string(),
+                dockerfile_path: Some("Dockerfile".into()),
+                source_context_hash: Some("same-context-hash".into()),
+            })
+            .await
+            .expect("matching context hash should reuse the ready image");
+
+        assert_eq!(reused_job.status, BuildStatus::Ready);
+        assert_ne!(reused_job.build_id, ready_job.build_id);
+        assert_eq!(reused_job.image_name, ready_job.image_name);
+        assert_eq!(reused_job.template_path, ready_job.template_path);
+        assert_eq!(
+            reused_job.source_archive_path,
+            ready_job.source_archive_path
+        );
+        assert_eq!(
+            reused_job.source_context_hash,
+            ready_job.source_context_hash
+        );
+
+        let _ = std::fs::remove_dir_all(Path::new(&config.bundle_root_dir));
     }
 
     #[test]

@@ -40,6 +40,7 @@ pub struct BuilderConfig {
     pub artifact_registry_repo: String,
     pub build_source_bucket: String,
     pub bundle_root_dir: String,
+    pub lab_build_artifacts_database_url: Option<String>,
     pub cloud_build_timeout_seconds: u64,
     pub cloud_build_poll_interval_seconds: u64,
     pub cloud_build_service_account: Option<String>,
@@ -77,6 +78,9 @@ impl State {
             artifact_registry_repo: env_or_default("ARTIFACT_REGISTRY_REPO", "altair-labs"),
             build_source_bucket: env_or_default("LAB_BUILD_SOURCE_BUCKET", "altair-lab-builds"),
             bundle_root_dir: env_or_default("LAB_BUNDLE_ROOT_DIR", "/tmp/altair-lab-builder"),
+            lab_build_artifacts_database_url: optional_env("LAB_BUILD_ARTIFACTS_DATABASE_URL")
+                .or_else(|| optional_env("LABS_MS_DATABASE_URL"))
+                .or_else(|| optional_env("LABS_DATABASE_URL")),
             cloud_build_timeout_seconds: env_u64_or_default("CLOUD_BUILD_TIMEOUT_SECONDS", 1200),
             cloud_build_poll_interval_seconds: env_u64_or_default(
                 "CLOUD_BUILD_POLL_INTERVAL_SECONDS",

@@ -132,6 +132,31 @@ pub async fn create_build_from_upload(
         "Source bundle created for build-from-upload request"
     );
 
+    if let Some(build_job) = state
+        .builds_service
+        .reuse_ready_build_if_context_matches(
+            payload.lab_id.clone(),
+            payload.requested_by.clone(),
+            image_name.clone(),
+            payload.image_tag.clone(),
+            payload.dockerfile_path.clone(),
+            bundle.source_context_hash.clone(),
+        )
+        .await?
+    {
+        info!(
+            build_id = %build_job.build_id,
+            template_path = %build_job.template_path,
+            source_context_hash = %bundle.source_context_hash,
+            "Reusing existing lab image; skipping source upload and build"
+        );
+
+        return Ok(Json(ApiResponse::success(BuildFromUploadResponse {
+            source_bundle: bundle,
+            build_job,
+        })));
+    }
+
     let source_archive_path = if state.builds_service.is_local_mode() {
         bundle.archive_path.clone()
     } else {
@@ -155,6 +180,7 @@ pub async fn create_build_from_upload(
             image_tag: payload.image_tag,
             source_archive_path,
             dockerfile_path: payload.dockerfile_path,
+            source_context_hash: Some(bundle.source_context_hash.clone()),
         })
         .await?;
     info!(

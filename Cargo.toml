@@ -10,8 +10,10 @@ dotenvy = "0.15"
 flate2 = "1"
 gcp_auth = "0.12"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ring = "0.17"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+sqlx = { version = "0.8", default-features = false, features = ["derive", "postgres", "runtime-tokio", "tls-rustls"] }
 tar = "0.4"
 thiserror = "1"
 tokio = { version = "1", features = ["fs", "macros", "process", "rt-multi-thread", "sync", "time"] }
