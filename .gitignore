@@ -1,2 +1,45 @@
-target/
+# Rust / Cargo
+/target/
+**/*.rs.bk
+*.rlib
+*.so
+*.dll
+*.dylib
+core
+*.core
+
+# Logs / runtime
+*.log
+*.tmp
+*.pid
+
+# Local environment files
 .env
+.env.*
+!.env.example
+
+# IDE / editors
+.vscode/
+.idea/
+.history/
+*.code-workspace
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Docker / local data
+/docker/*.pid
+/docker/*.sock
+/docker/logs/
+docker-compose.override.yml
+volumes/
+data/
+tmp/
+
+# Node artifacts if tools are installed locally
+node_modules/
+dist/
+build/
