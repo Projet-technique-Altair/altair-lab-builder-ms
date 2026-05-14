@@ -50,7 +50,10 @@ use crate::{
         source_bundle::{SourceBundle, UploadedFile},
         state::BuilderConfig,
     },
-    services::path_safety::{ensure_builder_root_dir, join_relative_to_root},
+    services::{
+        file_policy::is_allowed_upload_name,
+        path_safety::{ensure_builder_root_dir, join_relative_to_root},
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -126,6 +129,13 @@ impl SourceBundlesService {
 
         for file in files {
             let sanitized_path = sanitize_relative_path(&file.relative_path)?;
+            let upload_name = sanitized_path.to_string_lossy();
+            if !is_allowed_upload_name(&upload_name) {
+                return Err(AppError::BadRequest(format!(
+                    "Unsupported uploaded file type: {upload_name}"
+                )));
+            }
+
             let destination = join_relative_to_root(&workspace_dir, &sanitized_path)?;
 
             if let Some(parent) = destination.parent() {
@@ -426,6 +436,31 @@ mod tests {
                 bundle.bundle_id
             )
         );
+
+        let _ = std::fs::remove_dir_all(bundle_root);
+    }
+
+    #[tokio::test]
+    async fn create_source_bundle_rejects_files_outside_upload_mask() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be valid")
+            .as_nanos();
+        let bundle_root = std::env::temp_dir().join(format!("lab-builder-test-{unique}"));
+        let service = SourceBundlesService::new(test_config(bundle_root.display().to_string()));
+
+        let result = service
+            .create_source_bundle(
+                Some("lab-1".into()),
+                Some("creator-1".into()),
+                vec![UploadedFileInput {
+                    relative_path: "bin/payload.exe".into(),
+                    bytes: b"not allowed".to_vec(),
+                }],
+            )
+            .await;
+
+        assert!(result.is_err());
 
         let _ = std::fs::remove_dir_all(bundle_root);
     }

@@ -44,7 +44,7 @@ use crate::{
         source_bundle::{BuildFromUploadResponse, SourceBundle},
         state::State as AppState,
     },
-    services::source_bundles::UploadedFileInput,
+    services::{file_policy::is_allowed_upload_name, source_bundles::UploadedFileInput},
 };
 
 struct SourceBundleMultipartPayload {
@@ -248,6 +248,12 @@ async fn parse_source_bundle_payload(
                 .await?
             }
             (_, Some(file_name)) => {
+                if !is_allowed_upload_name(&file_name) {
+                    return Err(AppError::BadRequest(format!(
+                        "Unsupported uploaded file type: {file_name}"
+                    )));
+                }
+
                 if uploaded_files.len() >= state.source_bundles_service.max_upload_files() {
                     return Err(AppError::BadRequest(
                         "Upload contains too many files".into(),
