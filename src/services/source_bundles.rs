@@ -248,6 +248,23 @@ impl SourceBundlesService {
             )));
         }
 
+        // Clean up the local bundle directory (workspace + archive) now that the
+        // archive is safely stored in GCS. Two levels up: source.tar.gz → artifacts → <uuid>.
+        let bundle_dir = Path::new(&bundle.archive_path)
+            .parent()
+            .and_then(|p| p.parent());
+        if let Some(dir) = bundle_dir {
+            if let Err(error) = fs::remove_dir_all(dir).await {
+                tracing::warn!(
+                    dir = %dir.display(),
+                    %error,
+                    "Failed to clean up local bundle directory after GCS upload"
+                );
+            } else {
+                info!(dir = %dir.display(), "Local bundle directory removed after GCS upload");
+            }
+        }
+
         Ok(bundle.suggested_gcs_path.clone())
     }
 }
