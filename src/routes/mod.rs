@@ -25,6 +25,10 @@
  * @packageDocumentation
  */
 use axum::{
+    extract::Request,
+    http::StatusCode,
+    middleware::{from_fn, Next},
+    response::Response,
     routing::{get, post},
     Router,
 };
@@ -43,10 +47,27 @@ pub mod health;
 pub mod source_bundles;
 
 pub fn init_routes() -> Router<State> {
-    Router::new()
-        .route("/health", get(health))
+    let protected = Router::new()
         .route("/builds", post(create_build))
         .route("/builds/from-upload", post(create_build_from_upload))
         .route("/builds/{build_id}", get(get_build))
         .route("/source-bundles", post(create_source_bundle))
+        .layer(from_fn(require_internal_token));
+
+    Router::new().route("/health", get(health)).merge(protected)
+}
+
+async fn require_internal_token(req: Request, next: Next) -> Result<Response, StatusCode> {
+    let expected =
+        std::env::var("INTERNAL_SERVICE_TOKEN").unwrap_or_else(|_| "local-dev-token".to_string());
+    let provided = req
+        .headers()
+        .get("x-altair-internal-token")
+        .and_then(|value| value.to_str().ok());
+
+    if provided != Some(expected.as_str()) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+
+    Ok(next.run(req).await)
 }
