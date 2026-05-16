@@ -11,8 +11,8 @@
  *  - Initialize structured logging (`tracing`)
  *  - Build application state from environment (`State::from_env`)
  *  - Configure middleware:
- *      • CORS (allow all origins, methods, headers)
- *      • HTTP request tracing
+ * - • CORS (allow all origins, methods, headers)
+ * - • HTTP request tracing
  *  - Register routes and attach shared state
  *  - Start the HTTP server on the configured port
  *

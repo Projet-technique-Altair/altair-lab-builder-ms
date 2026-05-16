@@ -15,8 +15,8 @@
  * Key features:
  *
  *  - Dual execution mode:
- *      • Local (Docker + Kind cluster)
- *      • Cloud (GCP Cloud Build)
+ * - • Local (Docker + Kind cluster)
+ * - • Cloud (GCP Cloud Build)
  *  - Secure handling of source archives (path validation, sandboxing)
  *  - Full lifecycle tracking (queued → submitted → ready/failed)
  *  - Background processing using async tasks

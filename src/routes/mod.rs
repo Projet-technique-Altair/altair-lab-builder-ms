@@ -58,8 +58,8 @@ pub fn init_routes() -> Router<State> {
 }
 
 async fn require_internal_token(req: Request, next: Next) -> Result<Response, StatusCode> {
-    let expected = std::env::var("INTERNAL_SERVICE_TOKEN")
-        .unwrap_or_else(|_| "local-dev-token".to_string());
+    let expected =
+        std::env::var("INTERNAL_SERVICE_TOKEN").unwrap_or_else(|_| "local-dev-token".to_string());
     let provided = req
         .headers()
         .get("x-altair-internal-token")
